@@ -58,8 +58,7 @@ Modes:
                 is logged and the next one tried
   -n, --dry-run fetch and render; print the agenda as text instead of pushing
   --landscape   two columns for a Kindle on its side (top edge to the left):
-                weekday, month and today on the left (tomorrow follows there
-                once nothing is left today), the week on the right
+                weekday, month and today on the left, the week on the right
   --png PATH    also save the rendered screenshot to PATH
   --html PATH   also save the rendered page to PATH (to iterate on the layout)
   --restore     hand the Kindle back to the reader UI (start the framework,
@@ -714,12 +713,21 @@ def month_grid_html(today, busy_days):
             .format(today.strftime("%B %Y"), heads, "".join(rows)))
 
 
-def detail_rows_html(rows, budget):
-    """(html parts, px used) of rows in the detailed two-line style, as many
-    as fit the budget, the rest folded into one "+N more" line."""
-    parts, used = [], 0
-    for i, (label, title, state, inst) in enumerate(rows):
-        remaining_rows = len(rows) - i
+def today_html(today_rows, budget):
+    """(html, px used) of today's section — what is over collapses to one
+    line so what is next keeps its room late in the day."""
+    parts = ['<section class="today"><h2>Today</h2>']
+    used = TODAY_HEADING_PX
+    earlier = [title for _, title, state, _ in today_rows if state == "past"]
+    pending = [row for row in today_rows if row[2] != "past"]
+    if earlier:
+        parts.append('<div class="earlier"><span>Earlier</span>{}</div>'.format(esc(" · ".join(earlier))))
+        used += EARLIER_PX
+    if not pending:
+        parts.append('<div class="empty">{}</div>'.format("Nothing more today" if earlier else "Nothing scheduled"))
+        used += EARLIER_PX
+    for i, (label, title, state, inst) in enumerate(pending):
+        remaining_rows = len(pending) - i
         if budget - used - TODAY_ROW_PX < (MORE_PX if remaining_rows > 1 else 0):
             parts.append('<div class="more">+{} more</div>'.format(remaining_rows))
             used += MORE_PX
@@ -733,52 +741,18 @@ def detail_rows_html(rows, budget):
                      .format(state, time_html, esc(title),
                              '<small>{}</small>'.format(esc(location)) if location else ""))
         used += TODAY_ROW_PX
-    return parts, used
-
-
-def today_html(today_rows, budget, tomorrow=None):
-    """(html, px used, tomorrow shown) of today's section — what is over
-    collapses to one line so what is next keeps its room late in the day.
-    Once nothing is left for today, `tomorrow` ((date, rows), when given)
-    follows in the same detail (the landscape left column, where the week
-    is off in the other column)."""
-    parts = ['<section class="today"><h2>Today</h2>']
-    used = TODAY_HEADING_PX
-    earlier = [title for _, title, state, _ in today_rows if state == "past"]
-    pending = [row for row in today_rows if row[2] != "past"]
-    if earlier:
-        parts.append('<div class="earlier"><span>Earlier</span>{}</div>'.format(esc(" · ".join(earlier))))
-        used += EARLIER_PX
-    if not pending:
-        parts.append('<div class="empty">{}</div>'.format("Nothing more today" if earlier else "Nothing scheduled"))
-        used += EARLIER_PX
-    rows_html, rows_px = detail_rows_html(pending, budget - used)
-    parts += rows_html
-    used += rows_px
-    tomorrow_shown = (not pending and bool(tomorrow and tomorrow[1])
-                      and budget - used - TODAY_HEADING_PX >= TODAY_ROW_PX)
-    if tomorrow_shown:
-        parts.append("<h2>Tomorrow ({})</h2>".format(tomorrow[0].strftime("%a %-d")))
-        used += TODAY_HEADING_PX
-        rows_html, rows_px = detail_rows_html(tomorrow[1], budget - used)
-        parts += rows_html
-        used += rows_px
     parts.append("</section>")
-    return "".join(parts), used, tomorrow_shown
+    return "".join(parts), used
 
 
-def upcoming_html(days, budget, elsewhere=None):
+def upcoming_html(days, budget):
     """(html, last day shown, rows hidden) of the week ahead, compact; a day
     is printed only with at least one row, and once a day is skipped the
-    rest of the week is too. The day `elsewhere` is left out: it is already
-    spelled out in another part of the page."""
+    rest of the week is too."""
     parts = ['<section class="upcoming">']
     today = days[0][0]
     shown_through, hidden = today, 0
     for day, rows in days[1:]:
-        if day == elsewhere:
-            shown_through = day
-            continue
         available = budget - DAY_HEADING_PX
         fit = min(len(rows), max(0, available) // DAY_ROW_PX)
         if fit < len(rows) and available - fit * DAY_ROW_PX < MORE_PX:
@@ -820,15 +794,13 @@ def render_html(days, now, stale_feeds=0, feed_count=1, landscape=False):
         today.strftime("%A"), today.strftime("%B %-d, %Y"))
     grid = month_grid_html(today, {day for day, rows in days if rows})
     if landscape:
-        today_part, _, tomorrow_shown = today_html(
-            today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX, tomorrow=days[1])
-        week_part, shown_through, hidden = upcoming_html(
-            days, LANDSCAPE_PAGE_PX - FOOTER_PX, elsewhere=days[1][0] if tomorrow_shown else None)
+        today_part, _ = today_html(today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX)
+        week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX)
         body = ('<div class="page"><div class="cols"><div class="left">{}{}{}</div><div class="right">{}</div></div>{}</div>'
                 .format(header, grid, today_part, week_part,
                         footer_html(now, days, shown_through, hidden, stale_feeds, feed_count)))
     else:
-        today_part, used, _ = today_html(today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
+        today_part, used = today_html(today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
         week_part, shown_through, hidden = upcoming_html(
             days, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX - used)
         body = '<div class="page"><header>{}{}</header>{}{}{}</div>'.format(
@@ -1270,19 +1242,6 @@ def _test():
     wide = render_html(days, now, landscape=True)
     check("landscape page rotates and splits into columns",
           'class="landscape"' in wide and 'class="left"' in wide and "Overnight" in wide)
-    check("landscape keeps tomorrow off the left column while today has more", "<h2>Tomorrow" not in wide)
-    evening = localize(dt.datetime(2026, 9, 3, 20, 0), la)
-    quiet = run(feed("UID:q1\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nDTEND;TZID=America/Los_Angeles:20260903T093000\nSUMMARY:Standup",
-                     "UID:q2\nDTSTART;TZID=America/Los_Angeles:20260904T100000\nDTEND;TZID=America/Los_Angeles:20260904T110000\nSUMMARY:Dentist\nLOCATION:Downtown"))
-    done = render_html(agenda(quiet, dt.date(2026, 9, 3), evening), evening, landscape=True)
-    check("landscape follows a finished today with tomorrow in the left column",
-          "Nothing more today</div><h2>Tomorrow (Fri 4)</h2>" in done
-          and '<b>10:00 AM</b><small>– 11:00 AM</small></div><div class="title">Dentist<small>Downtown</small>' in done, done)
-    check("the week column leaves out the tomorrow shown on the left and carries on",
-          "<span>Friday 4</span>" not in done and "<span>Saturday 5</span>" in done, done)
-    check("the week column keeps tomorrow while it is off the left column", "<span>Friday 4</span>" in wide)
-    check("portrait leaves tomorrow to the week list",
-          "<h2>Tomorrow" not in render_html(agenda(quiet, dt.date(2026, 9, 3), evening), evening))
     check("no day heading is printed without at least one row", "</h3><div class=\"more\">" not in crowded)
 
     check("feed URL redacted in logs", redact("https://calendar.google.com/calendar/ical/x/private-abc/basic.ics")
