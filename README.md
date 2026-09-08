@@ -50,6 +50,7 @@ docker compose run --rm voyage-calendar --restore
 
 ```sh
 just check      # ruff + the built-in tests (./voyage-calendar --test)
+just push       # one push from this checkout with the .env settings, to preview a layout change on the Kindle
 docker build -t voyage-calendar . && docker run --rm --env-file .env -v $PWD:/out voyage-calendar --dry-run --landscape --png /out/out.png
 ```
 

@@ -21,6 +21,7 @@ works anywhere with Chrome or Chromium and an ssh client.
 Configuration comes from the environment (a feed URL is a credential: anyone
 holding it reads the calendar):
   VOYAGE_CALENDAR_ICS_URLS   whitespace-separated feed URLs, or local .ics paths
+                             (quotes around the whole list are fine)
   VOYAGE_CALENDAR_EMAIL      optional: your address, to drop invitations you
                              declined
   VOYAGE_CALENDAR_HOST       the Kindle: an ssh host alias, an address, or
@@ -556,7 +557,9 @@ def sort_key(value):
 # --- feeds ---------------------------------------------------------------------
 
 def feed_sources(env=os.environ):
-    urls = (env.get("VOYAGE_CALENDAR_ICS_URLS") or "").split()
+    # Quotes around the list keep dotenv parsers happy (compose strips them,
+    # `docker run --env-file` does not).
+    urls = (env.get("VOYAGE_CALENDAR_ICS_URLS") or "").strip().strip("\"'").split()
     if not urls:
         raise CalendarError("VOYAGE_CALENDAR_ICS_URLS must list at least one iCal feed "
                             "(see .zshenv.secret)", 3)
@@ -1290,6 +1293,7 @@ def _test():
     except CalendarError as exc:
         check("no feeds raises exit 3", exc.exit_code == 3)
     check("feed sources split on whitespace", feed_sources({"VOYAGE_CALENDAR_ICS_URLS": "a\n b"}) == ["a", "b"])
+    check("feed sources shed surrounding quotes", feed_sources({"VOYAGE_CALENDAR_ICS_URLS": '"a b"'}) == ["a", "b"])
     for name, script in (("keeper", KEEPER_SH), ("show", REMOTE_SHOW), ("restore", REMOTE_RESTORE)):
         proc = subprocess.run(["sh", "-n"], input=script.encode(), capture_output=True)
         check("remote {} script parses as sh".format(name), proc.returncode == 0, proc.stderr.decode())
