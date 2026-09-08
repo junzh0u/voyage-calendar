@@ -14,3 +14,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uvx ruff check voyage-calendar
       - run: ./voyage-calendar --test
+        env:
+          # Use the runner's Google Chrome; its Chromium crashes during rendering.
+          VOYAGE_CALENDAR_CHROME: google-chrome
