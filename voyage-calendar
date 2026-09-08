@@ -1,0 +1,1281 @@
+#!/usr/bin/env python3
+"""Show Google Calendar on a jailbroken Kindle Voyage as an always-on wall calendar.
+
+Fetches each calendar's secret iCal feed (Google Calendar → Settings → the
+calendar → "Secret address in iCal format"), expands recurring events over the
+next 7 days, lays the agenda out as HTML — today in detail, the coming days
+compact, the month grid in the header — screenshots it with headless Chrome or
+Chromium at the Voyage's 1072x1448 (300 ppi), and pushes the PNG to the Kindle
+over SSH, where FBInk from the USBNetwork package paints it. The push also
+turns the Kindle into a kiosk: the reader framework is stopped so nothing
+repaints over the calendar, powerd is told not to sleep, and a keeper loop is
+left running that re-enables Wi-Fi whenever it drops — the power button still
+suspends the device, and after the wake nothing else would reconnect it.
+`--restore` undoes all of it; a reboot brings the reader back on its own and
+the next push re-applies the kiosk.
+
+Meant to run as a container (Dockerfile and compose.yaml alongside) that
+repaints every 10 minutes with `--every 600`; a bare `python3 voyage-calendar`
+works anywhere with Chrome or Chromium and an ssh client.
+
+Configuration comes from the environment (a feed URL is a credential: anyone
+holding it reads the calendar):
+  VOYAGE_CALENDAR_ICS_URLS   whitespace-separated feed URLs, or local .ics paths
+  VOYAGE_CALENDAR_EMAIL      optional: your address, to drop invitations you
+                             declined
+  VOYAGE_CALENDAR_HOST       the Kindle: an ssh host alias, an address, or
+                             user@address (default: voyage; the user defaults
+                             to root, as on every jailbroken Kindle)
+  VOYAGE_CALENDAR_SSH_KEY    optional: private key for the Kindle. With it set,
+                             ssh offers only that key and keeps the Kindle's
+                             host key under the cache directory, so no ssh
+                             config or known_hosts is needed (a container)
+  VOYAGE_CALENDAR_CHROME     optional: the Chrome or Chromium binary (default:
+                             Google Chrome on macOS, else chromium or
+                             google-chrome on PATH)
+  VOYAGE_CALENDAR_CACHE_DIR  optional: where the last good copy of each feed
+                             lives (default: ~/.cache/voyage-calendar)
+  LOG_TIMESTAMP              optional: set it to prefix every log line with
+                             the time
+
+A feed that fails to download is served from its last good copy and the
+footer says so.
+
+Remote commands target the Kindle's BusyBox environment: scripts appear only
+as `sh` in `ps`, so inspect `/proc/*/cmdline`; `timeout` takes `-t N`; `/sbin`
+is absent from the SSH PATH; and device state is managed through the powerd,
+wifid, and cmd properties exposed by `lipc-get-prop` and `lipc-set-prop`.
+
+Recurrence covers what Google Calendar writes: DAILY, WEEKLY (BYDAY, WKST),
+MONTHLY (BYMONTHDAY, ordinal BYDAY such as 2TU or -1FR), YEARLY, with
+INTERVAL, COUNT, UNTIL, EXDATE, RDATE, and per-instance overrides
+(RECURRENCE-ID, including moved and cancelled instances).
+
+Modes:
+  (default)     fetch, render, push to the Kindle, and paint
+  --every SECS  repeat the default mode forever, SECS apart; a failed round
+                is logged and the next one tried
+  -n, --dry-run fetch and render; print the agenda as text instead of pushing
+  --landscape   two columns for a Kindle on its side (top edge to the left):
+                weekday, month and today on the left, the week on the right
+  --png PATH    also save the rendered screenshot to PATH
+  --html PATH   also save the rendered page to PATH (to iterate on the layout)
+  --restore     hand the Kindle back to the reader UI (start the framework,
+                allow sleep) and exit
+  --test        run unit tests
+
+Exit codes: 0 ok · 1 fetch, render, or push failed · 3 no feed configured
+"""
+import calendar
+import datetime as dt
+import hashlib
+import html
+import os
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+try:
+    import zoneinfo
+except ImportError:  # Python 3.8: TZIDs fall back to the local zone
+    zoneinfo = None
+
+WIDTH, HEIGHT = 1072, 1448  # the Voyage's panel, portrait
+DAYS = 7  # today plus the week ahead
+CHROME_CANDIDATES = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                     "chromium", "chromium-browser", "google-chrome", "google-chrome-stable")
+CACHE_DIR = os.environ.get("VOYAGE_CALENDAR_CACHE_DIR") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "voyage-calendar")
+REMOTE_DIR = "/mnt/us/voyage-calendar"
+WEEKDAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")  # index == date.weekday()
+MONTH_GRID_STARTS_ON = 6  # Sunday, as Google Calendar shows it
+MAX_PERIODS = 20000  # recurrence periods walked before giving up on a rule
+
+# The Kindle side, run by sh with the PNG on stdin. USBNetwork's bin holds
+# fbink; /sbin holds upstart's stop/start; pidof is busybox. cvm is the Java
+# VM the reader framework runs in — stopped, nothing repaints over the image.
+# preventScreenSaver keeps powerd (and with it Wi-Fi) awake; it resets on
+# reboot, so it is set on every push. The power button still suspends the
+# device, and after the wake nothing asks the connection manager to
+# reassociate once the framework is gone — the keeper loop below does, so
+# the next push gets through. It is (re)written on every push and started
+# when no instance is running.
+KEEPER_SH = """#!/bin/sh
+# voyage-calendar keeper — written by the Mac's push; do not edit here.
+# Brings Wi-Fi back whenever wifid reports it down (after a suspend/resume,
+# typically), so the calendar pushes keep reaching this Kindle.
+export PATH=/mnt/us/usbnet/bin:/usr/sbin:/sbin:/usr/bin:/bin
+log={dir}/keeper.log
+essid=
+while true; do
+    state=$(timeout -t 10 lipc-get-prop -s com.lab126.wifid cmState 2>/dev/null)
+    if [ "$state" = CONNECTED ]; then
+        essid=$(wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^ssid=//p')
+    else
+        [ -f $log ] && [ $(wc -c < $log) -gt 20000 ] && mv -f $log $log.old
+        echo "$(date '+%Y-%m-%d %H:%M:%S') wifi ${{state:-unknown}}: reconnecting${{essid:+ to $essid}}" >> $log
+        # the sequence KOReader uses, then the connection manager's own
+        # reconnect for the network we last saw
+        lipc-set-prop com.lab126.cmd wirelessEnable 1
+        lipc-set-prop com.lab126.wifid enable 1
+        [ -n "$essid" ] && lipc-set-prop com.lab126.cmd ensureConnection "wifi:$essid"
+        sleep 30
+    fi
+    sleep 15
+done
+""".format(dir=REMOTE_DIR)
+# pids of running keepers. The Kindle's busybox ps prints only "sh" for a
+# script, so match the argv in /proc — as a case pattern, not grep, whose
+# own argv (and this remote shell's) would match too.
+REMOTE_KEEPERS = """keepers() {
+    for p in /proc/[0-9]*; do
+        case "$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)" in "sh $d/keeper.sh "*) echo ${p#/proc/};; esac
+    done
+}"""
+REMOTE_SHOW = """
+export PATH=/mnt/us/usbnet/bin:/usr/sbin:/sbin:/usr/bin:/bin
+d={dir}
+mkdir -p $d && cat > $d/dash.png.new && mv -f $d/dash.png.new $d/dash.png || exit 10
+if pidof cvm >/dev/null 2>&1; then stop framework >/dev/null 2>&1 || exit 11; fi
+lipc-set-prop com.lab126.powerd preventScreenSaver 1 || exit 12
+fbink -q -c -f -g file=$d/dash.png || exit 13
+cat > $d/keeper.sh.new <<'KEEPER'
+{keeper}KEEPER
+{keepers}
+if ! cmp -s $d/keeper.sh.new $d/keeper.sh; then mv -f $d/keeper.sh.new $d/keeper.sh; changed=1; fi
+rm -f $d/keeper.sh.new
+set -- $(keepers)
+if [ -n "$changed" ] || [ $# -ne 1 ]; then
+    [ $# -gt 0 ] && kill "$@" 2>/dev/null
+    nohup setsid sh $d/keeper.sh </dev/null >/dev/null 2>&1 &
+fi
+""".format(dir=REMOTE_DIR, keeper=KEEPER_SH, keepers=REMOTE_KEEPERS)
+REMOTE_RESTORE = """
+export PATH=/mnt/us/usbnet/bin:/usr/sbin:/sbin:/usr/bin:/bin
+d={dir}
+{keepers}
+kill $(keepers) 2>/dev/null
+lipc-set-prop com.lab126.powerd preventScreenSaver 0
+pidof cvm >/dev/null 2>&1 || start framework >/dev/null 2>&1
+""".format(dir=REMOTE_DIR, keepers=REMOTE_KEEPERS)
+
+
+def say(message, file=sys.stdout):
+    if os.environ.get("LOG_TIMESTAMP"):
+        message = time.strftime("%Y-%m-%d %H:%M:%S ") + message
+    print(message, file=file)
+
+
+class CalendarError(Exception):
+    def __init__(self, message, exit_code=1):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+# --- iCalendar parsing ---------------------------------------------------------
+
+def unfold(text):
+    """Content lines of an iCalendar text, with folded continuations joined."""
+    lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw[:1] in (" ", "\t") and lines:
+            lines[-1] += raw[1:]
+        elif raw:
+            lines.append(raw)
+    return lines
+
+
+def parse_line(line):
+    """(name, params, value) of a content line: NAME;P=V;Q="a:b":value."""
+    i, quoted = 0, False
+    while i < len(line):
+        c = line[i]
+        if c == '"':
+            quoted = not quoted
+        elif c == ":" and not quoted:
+            break
+        i += 1
+    head, value = line[:i], line[i + 1:]
+    parts, buf, quoted = [], "", False
+    for c in head:
+        if c == '"':
+            quoted = not quoted
+        elif c == ";" and not quoted:
+            parts.append(buf)
+            buf = ""
+            continue
+        buf += c
+    parts.append(buf)
+    params = {}
+    for part in parts[1:]:
+        key, _, val = part.partition("=")
+        params[key.upper()] = val.strip('"')
+    return parts[0].upper(), params, value
+
+
+def unescape_text(value):
+    out, i = "", 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\" and i + 1 < len(value):
+            nxt = value[i + 1]
+            out += "\n" if nxt in "nN" else nxt
+            i += 2
+        else:
+            out += c
+            i += 1
+    return out
+
+
+def parse_components(text):
+    """VEVENT components as lists of (name, params, value), nested ones
+    (VALARM) dropped."""
+    events, stack = [], []
+    for line in unfold(text):
+        name, params, value = parse_line(line)
+        if name == "BEGIN":
+            stack.append((value.upper(), []))
+        elif name == "END":
+            if not stack:
+                continue
+            kind, props = stack.pop()
+            if kind == "VEVENT":
+                events.append(props)
+        elif stack:
+            stack[-1][1].append((name, params, value))
+    return events
+
+
+def zone(tzid):
+    """tzinfo for a TZID, None (meaning the local zone) when unknown."""
+    if not tzid or zoneinfo is None:
+        return None
+    try:
+        return zoneinfo.ZoneInfo(tzid)
+    except Exception:
+        return None
+
+
+def parse_datetime(value, params):
+    """(naive wall-clock datetime, tz, all_day) of a DATE / DATE-TIME value.
+    tz is the zone the wall clock is in: a tzinfo, or None for the local
+    zone (also the fallback for a TZID zoneinfo cannot resolve)."""
+    value = value.strip()
+    if params.get("VALUE") == "DATE" or len(value) == 8:
+        return dt.datetime.strptime(value, "%Y%m%d"), None, True
+    if value.endswith("Z"):
+        return dt.datetime.strptime(value[:-1], "%Y%m%dT%H%M%S"), dt.timezone.utc, False
+    return dt.datetime.strptime(value[:15], "%Y%m%dT%H%M%S"), zone(params.get("TZID")), False
+
+
+def localize(naive, tz):
+    """Aware local-zone datetime of a wall-clock time in tz (None: local)."""
+    if tz is None:
+        return naive.astimezone()
+    return naive.replace(tzinfo=tz).astimezone()
+
+
+def in_zone(naive, tz, target):
+    """Wall clock of `naive` (in tz) rewritten in the `target` zone."""
+    aware = localize(naive, tz)
+    if target is None:
+        return aware.replace(tzinfo=None)
+    return aware.astimezone(target).replace(tzinfo=None)
+
+
+def parse_duration(value):
+    """timedelta of an RFC 5545 DURATION (P1DT2H30M, -PT15M, P2W)."""
+    sign = -1 if value.startswith("-") else 1
+    value = value.lstrip("+-")
+    if not value.startswith("P"):
+        raise ValueError(value)
+    days = seconds = 0
+    number, in_time = "", False
+    for c in value[1:]:
+        if c.isdigit():
+            number += c
+        elif c == "T":
+            in_time = True
+        else:
+            n = int(number or 0)
+            number = ""
+            if c == "W":
+                days += 7 * n
+            elif c == "D":
+                days += n
+            elif c == "H":
+                seconds += 3600 * n
+            elif c == "M" and in_time:
+                seconds += 60 * n
+            elif c == "S":
+                seconds += n
+    return sign * dt.timedelta(days=days, seconds=seconds)
+
+
+def parse_rrule(value):
+    rule = {}
+    for part in value.split(";"):
+        key, _, val = part.partition("=")
+        key = key.upper()
+        if key in ("BYDAY", "BYMONTHDAY", "BYMONTH", "BYSETPOS"):
+            rule[key] = [v.strip().upper() for v in val.split(",") if v.strip()]
+        else:
+            rule[key] = val.strip().upper()
+    return rule
+
+
+class Event(object):
+    def __init__(self, props):
+        self.uid = self.summary = self.location = self.status = ""
+        self.rrule = None
+        self.exdates, self.rdates = set(), []
+        self.recurrence_id = None
+        self.declined_by = set()
+        self.start = self.tz = self.all_day = None
+        self.duration = None
+        end = None
+        for name, params, value in props:
+            if name == "UID":
+                self.uid = value
+            elif name == "SUMMARY":
+                self.summary = unescape_text(value).strip()
+            elif name == "LOCATION":
+                self.location = unescape_text(value).strip()
+            elif name == "STATUS":
+                self.status = value.strip().upper()
+            elif name == "DTSTART":
+                self.start, self.tz, self.all_day = parse_datetime(value, params)
+            elif name == "DTEND":
+                end = parse_datetime(value, params)
+            elif name == "DURATION":
+                self.duration = parse_duration(value)
+            elif name == "RRULE":
+                self.rrule = parse_rrule(value)
+            elif name in ("EXDATE", "RDATE"):
+                for v in value.split(","):
+                    naive, tz, _ = parse_datetime(v, params)
+                    (self.exdates.add if name == "EXDATE" else self.rdates.append)((naive, tz))
+            elif name == "RECURRENCE-ID":
+                self.recurrence_id = parse_datetime(value, params)[:2]
+            elif name == "ATTENDEE" and params.get("PARTSTAT", "").upper() == "DECLINED":
+                self.declined_by.add(value.strip().lower().replace("mailto:", ""))
+        if self.start is None:
+            raise ValueError("VEVENT without DTSTART")
+        if self.duration is None:
+            if end is not None:
+                self.duration = localize(end[0], end[1]) - localize(self.start, self.tz) \
+                    if not self.all_day else end[0] - self.start
+            else:
+                self.duration = dt.timedelta(days=1) if self.all_day else dt.timedelta()
+        # exception dates and recurrence ids are compared on the master's
+        # wall clock, whatever zone they were written in
+        self.exdates = {self.wall(n, tz) for n, tz in self.exdates}
+        self.rdates = [self.wall(n, tz) for n, tz in self.rdates]
+        if self.recurrence_id:
+            self.recurrence_id = self.wall(*self.recurrence_id)
+
+    def wall(self, naive, tz):
+        if self.all_day or tz == self.tz:
+            return naive
+        return in_zone(naive, tz, self.tz)
+
+    def declined(self, email):
+        return bool(email) and email.lower() in self.declined_by
+
+
+def weekday_index(token):
+    """(ordinal or None, weekday) of a BYDAY token such as MO, 2TU, -1FR."""
+    token = token.strip().upper()
+    ordinal = token[:-2]
+    return (int(ordinal) if ordinal else None), WEEKDAYS.index(token[-2:])
+
+
+def month_days(year, month, rule, default_day):
+    """Sorted days of a month matched by BYDAY / BYMONTHDAY, else the
+    default day (none when the month is too short)."""
+    last = calendar.monthrange(year, month)[1]
+    days = set()
+    if rule.get("BYDAY"):
+        by_weekday = {}
+        for d in range(1, last + 1):
+            by_weekday.setdefault(dt.date(year, month, d).weekday(), []).append(d)
+        for token in rule["BYDAY"]:
+            ordinal, weekday = weekday_index(token)
+            candidates = by_weekday.get(weekday, [])
+            if ordinal is None:
+                days.update(candidates)
+            elif -len(candidates) <= ordinal <= len(candidates) and ordinal != 0:
+                days.add(candidates[ordinal - 1 if ordinal > 0 else ordinal])
+    elif rule.get("BYMONTHDAY"):
+        for token in rule["BYMONTHDAY"]:
+            n = int(token)
+            d = n if n > 0 else last + 1 + n
+            if 1 <= d <= last:
+                days.add(d)
+    elif default_day <= last:
+        days.add(default_day)
+    return sorted(days)
+
+
+def occurrences(start, rule, limit):
+    """Wall-clock starts of a recurrence in order: from `start` (naive) up to
+    `limit` (naive, inclusive) or the rule's COUNT / UNTIL (naive, in the
+    same wall clock). Unsupported rules yield just the start."""
+    freq = rule.get("FREQ")
+    interval = max(1, int(rule.get("INTERVAL", 1) or 1))
+    count = int(rule["COUNT"]) if rule.get("COUNT") else None
+    until = rule.get("_UNTIL")
+    if until is not None and until < limit:
+        limit = until
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        if start <= limit:
+            yield start
+        return
+    emitted = 0
+    for period in range(MAX_PERIODS):
+        if freq == "DAILY":
+            base = start + dt.timedelta(days=period * interval)
+            candidates = [base]
+        elif freq == "WEEKLY":
+            wkst = WEEKDAYS.index(rule.get("WKST", "MO")) if rule.get("WKST") in WEEKDAYS else 0
+            week0 = start - dt.timedelta(days=(start.weekday() - wkst) % 7)
+            base = week0 + dt.timedelta(weeks=period * interval)
+            bydays = {weekday_index(t)[1] for t in rule.get("BYDAY") or [WEEKDAYS[start.weekday()]]}
+            candidates = [base + dt.timedelta(days=d) for d in range(7)
+                          if (base + dt.timedelta(days=d)).weekday() in bydays]
+        else:
+            months = period * interval if freq == "MONTHLY" else 0
+            years = period * interval if freq == "YEARLY" else 0
+            month0 = start.month - 1 + months
+            year = start.year + years + month0 // 12
+            base = start.replace(year=year, month=month0 % 12 + 1, day=1)
+            month_list = [base.month]
+            if freq == "YEARLY" and rule.get("BYMONTH"):
+                month_list = sorted(int(m) for m in rule["BYMONTH"])
+            candidates = []
+            for month in month_list:
+                for day in month_days(year, month, rule, start.day):
+                    candidates.append(base.replace(month=month, day=day))
+        if base > limit:
+            return
+        for candidate in candidates:
+            if candidate < start:
+                continue
+            if candidate > limit:
+                return
+            yield candidate
+            emitted += 1
+            if count is not None and emitted >= count:
+                return
+
+
+def load_events(components, email=None):
+    """(events, overrides) from parsed VEVENTs: the events to expand and,
+    per UID, the master wall-clock instances that override VEVENTs replace."""
+    events, overrides = [], {}
+    for props in components:
+        try:
+            event = Event(props)
+        except (ValueError, KeyError, IndexError):
+            continue
+        if event.recurrence_id is not None:
+            overrides.setdefault(event.uid, set()).add(event.recurrence_id)
+        events.append(event)
+    return events, overrides
+
+
+class Instance(object):
+    """One occurrence: start/end are aware local datetimes, or dates (end
+    exclusive) for all-day events."""
+
+    def __init__(self, event, start, end):
+        self.event = event
+        self.start, self.end = start, end
+        self.all_day = event.all_day
+        self.title = event.summary or "(untitled)"
+
+    def __repr__(self):
+        return "<{} {} {}>".format(self.title, self.start, self.end)
+
+
+def expand(events, overrides, window_start, window_end, email=None):
+    """Instances overlapping [window_start, window_end) (aware local), sorted."""
+    result = []
+    window_start_date, window_end_date = window_start.date(), window_end.date() + dt.timedelta(days=1)
+    for event in events:
+        if event.status == "CANCELLED" or event.declined(email):
+            continue
+        replaced = overrides.get(event.uid, set()) if event.recurrence_id is None else set()
+        if event.all_day:
+            limit = dt.datetime.combine(window_end_date, dt.time())
+        else:
+            limit = in_zone(window_end.replace(tzinfo=None), None, event.tz)
+        if event.rrule:
+            rule = dict(event.rrule)
+            if rule.get("UNTIL"):
+                naive, tz, all_day = parse_datetime(rule["UNTIL"], {})
+                if event.all_day and not all_day:
+                    naive = naive.replace(hour=0, minute=0, second=0)
+                elif all_day and not event.all_day:
+                    naive = naive.replace(hour=23, minute=59, second=59)
+                rule["_UNTIL"] = event.wall(naive, tz) if not event.all_day else naive
+            starts = list(occurrences(event.start, rule, limit))
+            starts.extend(r for r in event.rdates if r <= limit)
+        else:
+            starts = [event.start]
+        for naive in sorted(set(starts)):
+            if naive in event.exdates or naive in replaced:
+                continue
+            if event.all_day:
+                start = naive.date()
+                end = start + max(event.duration, dt.timedelta(days=1))
+                if start < window_end_date and end > window_start_date:
+                    result.append(Instance(event, start, end))
+            else:
+                start = localize(naive, event.tz)
+                end = start + event.duration
+                if start < window_end and max(end, start + dt.timedelta(minutes=1)) > window_start:
+                    result.append(Instance(event, start, end))
+    result.sort(key=lambda i: (sort_key(i.start), not i.all_day, i.title.lower()))
+    return result
+
+
+def sort_key(value):
+    if isinstance(value, dt.datetime):
+        return value.timestamp()
+    return time.mktime(dt.datetime.combine(value, dt.time()).timetuple())
+
+
+# --- feeds ---------------------------------------------------------------------
+
+def feed_sources(env=os.environ):
+    urls = (env.get("VOYAGE_CALENDAR_ICS_URLS") or "").split()
+    if not urls:
+        raise CalendarError("VOYAGE_CALENDAR_ICS_URLS must list at least one iCal feed "
+                            "(see .zshenv.secret)", 3)
+    return urls
+
+
+def fetch_feed(source, cache_dir=CACHE_DIR, timeout=30):
+    """(ics text, stale) — stale when the download failed and the cache
+    answered instead."""
+    if not source.startswith(("http://", "https://")):
+        with open(os.path.expanduser(source), "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(), False
+    cache = os.path.join(cache_dir, hashlib.sha1(source.encode("utf-8")).hexdigest() + ".ics")
+    req = urllib.request.Request(source, headers={"User-Agent": "voyage-calendar (dotfiles)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace")
+        if "BEGIN:VCALENDAR" not in text:
+            raise CalendarError("not an iCalendar feed")
+    except (urllib.error.URLError, OSError, CalendarError) as exc:
+        if os.path.exists(cache):
+            with open(cache, "r", encoding="utf-8") as fh:
+                return fh.read(), True
+        raise CalendarError("{}: {}".format(redact(source), exc))
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp = cache + ".new"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, cache)
+    return text, False
+
+
+def redact(source):
+    """A feed URL without its secret path, for logs."""
+    if "://" not in source:
+        return source
+    scheme, _, rest = source.partition("://")
+    host = rest.split("/", 1)[0]
+    return "{}://{}/…".format(scheme, host)
+
+
+# --- agenda ------------------------------------------------------------------
+
+def clock(value):
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def span_label(start, end):
+    """9:00 – 9:30 AM, or 11:30 AM – 12:30 PM across noon."""
+    if start.strftime("%p") == end.strftime("%p"):
+        return "{} – {}".format(start.strftime("%I:%M").lstrip("0"), clock(end))
+    return "{} – {}".format(clock(start), clock(end))
+
+
+def day_entries(instances, day, now):
+    """Rows for one day: (time label, title, state) with state one of
+    past / now / later / allday."""
+    day_start = dt.datetime.combine(day, dt.time()).astimezone()
+    day_end = day_start + dt.timedelta(days=1)
+    rows = []
+    for inst in instances:
+        if inst.all_day:
+            if inst.start <= day < inst.end:
+                span = (inst.end - inst.start).days
+                label = "All day" if span <= 1 else "Day {} of {}".format((day - inst.start).days + 1, span)
+                rows.append((label, inst.title, "allday", inst))
+            continue
+        effective_end = max(inst.end, inst.start + dt.timedelta(minutes=1))
+        if not (inst.start < day_end and effective_end > day_start):
+            continue
+        if inst.start < day_start:
+            label = "→ {}".format(clock(inst.end)) if inst.end < day_end else "All day"
+        elif inst.end > day_end:
+            label = "{} →".format(clock(inst.start))
+        elif inst.end <= inst.start:
+            label = clock(inst.start)
+        else:
+            label = span_label(inst.start, inst.end)
+        if effective_end <= now:
+            state = "past"
+        elif inst.start <= now:
+            state = "now"
+        else:
+            state = "later"
+        rows.append((label, inst.title, state, inst))
+    return rows
+
+
+def agenda(instances, today, now):
+    """[(date, rows)] for DAYS days from today."""
+    return [(today + dt.timedelta(days=i), day_entries(instances, today + dt.timedelta(days=i), now))
+            for i in range(DAYS)]
+
+
+def agenda_text(days):
+    lines = []
+    for i, (day, rows) in enumerate(days):
+        lines.append(day.strftime("%A, %B %-d, %Y") if i == 0 else day.strftime("%a %b %-d"))
+        if not rows:
+            lines.append("  —")
+        for label, title, state, _ in rows:
+            marker = {"past": "·", "now": "▶", "later": " ", "allday": " "}[state]
+            lines.append("  {} {:<20} {}".format(marker, label, title))
+    return "\n".join(lines)
+
+
+# Layout budget (px) so the page never overflows the panel: what the CSS below
+# gives each element, used to decide how many rows to print.
+FOOTER_PX = 44
+TODAY_HEADING_PX = 56
+TODAY_ROW_PX = 104  # two lines: time start/end beside title/location
+EARLIER_PX = 48
+DAY_HEADING_PX = 58
+DAY_ROW_PX = 60
+MORE_PX = 40
+# portrait: header (weekday, date, month grid) above one column
+PORTRAIT_PAGE_PX = HEIGHT - 44 - 36
+PORTRAIT_HEADER_PX = 320
+# landscape (the page drawn 1448x1072 and rotated onto the portrait panel):
+# weekday, date, month grid and today in the left column, the week in the right
+LANDSCAPE_PAGE_PX = WIDTH - 40 - 32
+LANDSCAPE_LEFT_HEADER_PX = 470
+
+
+def esc(text):
+    return html.escape(text, quote=True)
+
+
+def month_grid_html(today, busy_days):
+    first_weekday, last = calendar.monthrange(today.year, today.month)
+    lead = (first_weekday - MONTH_GRID_STARTS_ON) % 7
+    cells = [None] * lead + list(range(1, last + 1))
+    while len(cells) % 7:
+        cells.append(None)
+    heads = "".join("<th>{}</th>".format(calendar.day_abbr[(MONTH_GRID_STARTS_ON + i) % 7][:2])
+                    for i in range(7))
+    rows = []
+    for week in range(0, len(cells), 7):
+        tds = []
+        for d in cells[week:week + 7]:
+            if d is None:
+                tds.append("<td></td>")
+                continue
+            day = today.replace(day=d)
+            cls = " ".join(c for c in (
+                "today" if day == today else "",
+                "busy" if day in busy_days and day != today else "",
+                "gone" if day < today else "") if c)
+            tds.append('<td class="{}"><span>{}</span></td>'.format(cls, d))
+        rows.append("<tr>{}</tr>".format("".join(tds)))
+    return ('<table class="month"><caption>{}</caption><tr>{}</tr>{}</table>'
+            .format(today.strftime("%B %Y"), heads, "".join(rows)))
+
+
+def today_html(today_rows, budget):
+    """(html, px used) of today's section — what is over collapses to one
+    line so what is next keeps its room late in the day."""
+    parts = ['<section class="today"><h2>Today</h2>']
+    used = TODAY_HEADING_PX
+    earlier = [title for _, title, state, _ in today_rows if state == "past"]
+    pending = [row for row in today_rows if row[2] != "past"]
+    if earlier:
+        parts.append('<div class="earlier"><span>Earlier</span>{}</div>'.format(esc(" · ".join(earlier))))
+        used += EARLIER_PX
+    if not pending:
+        parts.append('<div class="empty">{}</div>'.format("Nothing more today" if earlier else "Nothing scheduled"))
+        used += EARLIER_PX
+    for i, (label, title, state, inst) in enumerate(pending):
+        remaining_rows = len(pending) - i
+        if budget - used - TODAY_ROW_PX < (MORE_PX if remaining_rows > 1 else 0):
+            parts.append('<div class="more">+{} more</div>'.format(remaining_rows))
+            used += MORE_PX
+            break
+        location = inst.event.location if "http" not in inst.event.location else ""
+        if state == "allday" or " – " not in label:
+            time_html = "<b>{}</b>".format(esc(label))
+        else:
+            time_html = "<b>{}</b><small>– {}</small>".format(esc(clock(inst.start)), esc(clock(inst.end)))
+        parts.append('<div class="row {}"><div class="time">{}</div><div class="title">{}{}</div></div>'
+                     .format(state, time_html, esc(title),
+                             '<small>{}</small>'.format(esc(location)) if location else ""))
+        used += TODAY_ROW_PX
+    parts.append("</section>")
+    return "".join(parts), used
+
+
+def upcoming_html(days, budget):
+    """(html, last day shown, rows hidden) of the week ahead, compact; a day
+    is printed only with at least one row, and once a day is skipped the
+    rest of the week is too."""
+    parts = ['<section class="upcoming">']
+    today = days[0][0]
+    shown_through, hidden = today, 0
+    for day, rows in days[1:]:
+        available = budget - DAY_HEADING_PX
+        fit = min(len(rows), max(0, available) // DAY_ROW_PX)
+        if fit < len(rows) and available - fit * DAY_ROW_PX < MORE_PX:
+            fit -= 1  # make room for the "+N more" line
+        if available < 0 or (rows and fit < 1) or shown_through != (day - dt.timedelta(days=1)):
+            hidden += len(rows)
+            continue
+        parts.append('<div class="day"><h3><span>{}</span>{}</h3>'.format(
+            day.strftime("%A %-d"), '<span class="none">nothing</span>' if not rows else ""))
+        budget -= DAY_HEADING_PX
+        shown_through = day
+        for label, title, state, inst in rows[:fit]:
+            parts.append('<div class="row {}"><div class="time">{}</div><div class="title">{}</div></div>'
+                         .format(state, esc(label), esc(title)))
+            budget -= DAY_ROW_PX
+        if fit < len(rows):
+            parts.append('<div class="more">+{} more</div>'.format(len(rows) - fit))
+            budget -= MORE_PX
+            hidden += len(rows) - fit
+        parts.append("</div>")
+    parts.append("</section>")
+    return "".join(parts), shown_through, hidden
+
+
+def footer_html(now, days, shown_through, hidden, stale_feeds, feed_count):
+    notes = []
+    if shown_through != days[-1][0]:
+        notes.append("through {}{}".format(shown_through.strftime("%A"),
+                                           " · {} more not shown".format(hidden) if hidden else ""))
+    if stale_feeds:
+        notes.append("{} of {} calendar{} from cache — fetch failed".format(
+            stale_feeds, feed_count, "s" if feed_count != 1 else ""))
+    return '<footer><span>Updated {}</span><span>{}</span></footer>'.format(clock(now), esc(" · ".join(notes)))
+
+
+def render_html(days, now, stale_feeds=0, feed_count=1, landscape=False):
+    today, today_rows = days[0]
+    header = '<div class="head"><div class="weekday">{}</div><div class="date">{}</div></div>'.format(
+        today.strftime("%A"), today.strftime("%B %-d, %Y"))
+    grid = month_grid_html(today, {day for day, rows in days if rows})
+    if landscape:
+        today_part, _ = today_html(today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX)
+        week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX)
+        body = ('<div class="page"><div class="cols"><div class="left">{}{}{}</div><div class="right">{}</div></div>{}</div>'
+                .format(header, grid, today_part, week_part,
+                        footer_html(now, days, shown_through, hidden, stale_feeds, feed_count)))
+    else:
+        today_part, used = today_html(today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
+        week_part, shown_through, hidden = upcoming_html(
+            days, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX - used)
+        body = '<div class="page"><header>{}{}</header>{}{}{}</div>'.format(
+            header, grid, today_part, week_part,
+            footer_html(now, days, shown_through, hidden, stale_feeds, feed_count))
+    return '<!doctype html><meta charset="utf-8"><title>voyage-calendar</title><style>{}</style><body class="{}">{}'.format(
+        CSS, "landscape" if landscape else "portrait", body)
+
+
+CSS = """
+* { box-sizing: border-box; }
+html, body { margin: 0; width: %(w)dpx; height: %(h)dpx; overflow: hidden; background: #fff; color: #000;
+  font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+.page { padding: 44px 52px 36px; height: %(h)dpx; display: flex; flex-direction: column; }
+header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 6px solid #000; padding-bottom: 24px; }
+.weekday { font-size: 104px; font-weight: 800; line-height: 1; letter-spacing: -2px; }
+.date { font-size: 46px; font-weight: 500; margin-top: 16px; }
+.month { border-collapse: collapse; }
+.month caption { font-size: 26px; font-weight: 700; text-align: right; padding-bottom: 6px; }
+.month th { font-size: 20px; font-weight: 600; color: #666; width: 44px; padding-bottom: 4px; text-transform: uppercase; }
+.month td { font-size: 26px; text-align: center; height: 42px; width: 44px; padding: 0; }
+.month td span { display: inline-block; width: 40px; height: 40px; line-height: 40px; border-radius: 50%%; }
+.month td.today span { background: #000; color: #fff; font-weight: 700; }
+.month td.busy span { font-weight: 700; box-shadow: inset 0 -4px 0 #000; border-radius: 0; line-height: 36px; }
+.month td.gone { color: #aaa; }
+h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacing: 3px; color: #444; margin: 22px 0 6px; }
+.row { display: flex; align-items: baseline; padding: 10px 0; border-bottom: 2px solid #ddd; }
+.today .row { padding-top: 14px; padding-bottom: 14px; }
+.time { flex: 0 0 300px; font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.today .row { align-items: flex-start; }
+.today .time { flex-basis: 260px; font-size: 38px; line-height: 1.15; }
+.today .time b { display: block; font-weight: 700; }
+.today .time small { display: block; font-size: 26px; color: #555; font-weight: 500; margin-top: 4px; }
+.title { flex: 1; font-size: 40px; font-weight: 500; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.title small { display: block; font-size: 26px; color: #555; font-weight: 400; margin-top: 4px; }
+.row.now { border-left: 12px solid #000; padding-left: 20px; margin-left: -32px; }  /* in the gutter: columns stay aligned */
+.earlier { font-size: 28px; color: #777; padding: 8px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.earlier span { font-weight: 700; text-transform: uppercase; letter-spacing: 2px; font-size: 22px; margin-right: 14px; }
+.empty { font-size: 36px; color: #777; padding: 8px 0; }
+.upcoming .day { margin-top: 14px; }
+.upcoming h3 { display: flex; justify-content: space-between; align-items: baseline; font-size: 28px; font-weight: 800; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 2px; border-bottom: 3px solid #000; padding-bottom: 6px; }
+.upcoming h3 .none { font-weight: 400; color: #999; letter-spacing: 0; text-transform: none; font-size: 26px; }
+.upcoming .time { flex-basis: 300px; font-size: 28px; }
+.upcoming .title { font-size: 34px; }
+.more { font-size: 28px; color: #666; padding: 6px 0; }
+footer { margin-top: auto; display: flex; justify-content: space-between; font-size: 24px; color: #777; padding-top: 10px; }
+
+/* landscape: drawn %(h)dx%(w)d, then turned a quarter clockwise onto the
+   portrait panel — hold the Kindle with its top edge to the left */
+.landscape .page { width: %(h)dpx; height: %(w)dpx; padding: 40px 48px 32px; transform-origin: top left;
+  transform: translate(%(w)dpx, 0) rotate(90deg); }
+.landscape .cols { display: flex; flex: 1; min-height: 0; }
+.landscape .left { flex: 0 0 520px; min-width: 0; padding-right: 44px; border-right: 6px solid #000; margin-right: 44px; display: flex; flex-direction: column; }
+.landscape .right { flex: 1; min-width: 0; }
+.landscape .weekday { font-size: 92px; }
+.landscape .date { font-size: 38px; margin-top: 12px; }
+.landscape .month { margin-top: 22px; }
+.landscape .month caption { text-align: left; }
+.landscape .today .row { padding-top: 10px; padding-bottom: 10px; }
+.landscape .today .time { flex-basis: 160px; font-size: 32px; }
+.landscape .today .time small { font-size: 22px; }
+.landscape .today .title { font-size: 32px; }
+.landscape .today .title small { font-size: 22px; }
+.landscape .upcoming .day:first-child { margin-top: 0; }
+""" % {"w": WIDTH, "h": HEIGHT}
+
+
+# --- rendering and pushing -----------------------------------------------------
+
+def chrome_binary():
+    """The Chrome or Chromium to render with, None when none is installed."""
+    configured = os.environ.get("VOYAGE_CALENDAR_CHROME")
+    if configured:
+        return configured
+    for candidate in CHROME_CANDIDATES:
+        if os.path.isabs(candidate):
+            if os.path.exists(candidate):
+                return candidate
+        elif shutil.which(candidate):
+            return shutil.which(candidate)
+    return None
+
+
+def screenshot(html_text, png_path, timeout=45):
+    """Render the page with headless Chrome to png_path. Chrome writes the
+    shot within a second but tends to linger afterwards, so wait for its
+    confirmation line and then stop it."""
+    chrome = chrome_binary()
+    if not chrome:
+        raise CalendarError("no Chrome or Chromium found (set VOYAGE_CALENDAR_CHROME)")
+    work = tempfile.mkdtemp(prefix="voyage-calendar-")
+    html_path = os.path.join(work, "page.html")
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html_text)
+    args = [chrome, "--headless=new", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-sync", "--disable-background-networking",
+            "--disable-gpu", "--disable-dev-shm-usage", "--hide-scrollbars",
+            "--force-device-scale-factor=1",
+            "--window-size={},{}".format(WIDTH, HEIGHT),
+            "--user-data-dir=" + os.path.join(work, "profile"),
+            "--screenshot=" + png_path, "file://" + html_path]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.append("--no-sandbox")  # Chromium refuses to sandbox as root, which is what a container runs it as
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as exc:
+        shutil.rmtree(work, ignore_errors=True)
+        raise CalendarError("could not run Chrome: {}".format(exc))
+    deadline = time.time() + timeout
+    written = False
+    try:
+        while time.time() < deadline:
+            ready, _, _ = select.select([proc.stderr], [], [], 0.5)
+            if ready:
+                line = proc.stderr.readline()
+                if not line:
+                    break
+                if b"written to file" in line:
+                    written = True
+                    break
+            elif proc.poll() is not None:
+                break
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(work, ignore_errors=True)
+    if not written and not (os.path.exists(png_path) and os.path.getsize(png_path)):
+        raise CalendarError("Chrome produced no screenshot within {}s".format(timeout))
+    with open(png_path, "rb") as fh:
+        return fh.read()
+
+
+def ssh_command(host):
+    """ssh argv up to (and including) the target, from the environment."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=accept-new"]
+    key = os.environ.get("VOYAGE_CALENDAR_SSH_KEY")
+    if key:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        cmd += ["-i", key, "-o", "IdentitiesOnly=yes",  # Dropbear caps auth attempts: offer nothing else
+                "-o", "UserKnownHostsFile=" + os.path.join(CACHE_DIR, "known_hosts")]
+    cmd.append(host if "@" in host else "root@" + host)
+    return cmd
+
+
+def kindle(host, script, stdin=b"", timeout=180):
+    try:
+        proc = subprocess.run(ssh_command(host) + [script], input=stdin, capture_output=True, timeout=timeout)
+    except OSError as exc:
+        raise CalendarError("could not run ssh: {}".format(exc))
+    except subprocess.TimeoutExpired:
+        raise CalendarError("ssh {} timed out".format(host))
+    if proc.returncode != 0:
+        step = {10: "storing the image", 11: "stopping the reader framework",
+                12: "keeping powerd awake", 13: "fbink"}.get(proc.returncode, "ssh")
+        detail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise CalendarError("{} on {} failed (exit {}){}".format(
+            step, host, proc.returncode, ": " + detail[-1] if detail else ""))
+
+
+# --- main --------------------------------------------------------------------
+
+def build(sources, email, now):
+    """(days, stale_feeds) — the agenda from every feed."""
+    components, stale = [], 0
+    for source in sources:
+        text, was_stale = fetch_feed(source)
+        stale += was_stale
+        components.extend(parse_components(text))
+    events, overrides = load_events(components)
+    today = now.date()
+    window_start = dt.datetime.combine(today, dt.time()).astimezone()
+    window_end = window_start + dt.timedelta(days=DAYS)
+    instances = expand(events, overrides, window_start, window_end, email)
+    return agenda(instances, today, now), stale
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    png_path = html_path = every = None
+    rest, args = [], list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg in ("--png", "--html", "--every"):
+            if not args:
+                print("voyage-calendar: {} needs a value".format(arg), file=sys.stderr)
+                return 2
+            value = args.pop(0)
+            if arg == "--png":
+                png_path = value
+            elif arg == "--html":
+                html_path = value
+            else:
+                try:
+                    every = int(value)
+                    if every <= 0:
+                        raise ValueError
+                except ValueError:
+                    print("voyage-calendar: --every needs a positive number of seconds", file=sys.stderr)
+                    return 2
+        else:
+            rest.append(arg)
+    flags = ("-n", "--dry-run", "--restore", "--landscape")
+    unknown = [arg for arg in rest if arg not in flags]
+    usage = ("usage: voyage-calendar [--landscape] [--png PATH] [--html PATH] [--every SECS] "
+             "[-n | --dry-run | --restore | --test | -h]")
+    if unknown:
+        print("voyage-calendar: invalid argument(s): {}".format(" ".join(unknown)), file=sys.stderr)
+        print(usage, file=sys.stderr)
+        return 2
+    if every and ("--restore" in rest or "-n" in rest or "--dry-run" in rest):
+        print("voyage-calendar: --every only repeats the default mode", file=sys.stderr)
+        print(usage, file=sys.stderr)
+        return 2
+    if every is None:
+        return run(rest, png_path, html_path)
+    while True:
+        started = time.time()
+        run(rest, png_path, html_path)
+        time.sleep(max(0, every - (time.time() - started)))
+
+
+def run(rest, png_path, html_path):
+    """One round of the mode in `rest`; the process exit code."""
+    host = os.environ.get("VOYAGE_CALENDAR_HOST") or "voyage"
+    dry_run = "-n" in rest or "--dry-run" in rest
+    try:
+        if "--restore" in rest:
+            kindle(host, REMOTE_RESTORE)
+            say("{}: reader UI restored".format(host))
+            return 0
+        sources = feed_sources()
+        now = dt.datetime.now().astimezone()
+        days, stale = build(sources, os.environ.get("VOYAGE_CALENDAR_EMAIL"), now)
+        page = render_html(days, now, stale, len(sources), landscape="--landscape" in rest)
+        if html_path:
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(page)
+        if dry_run:
+            print(agenda_text(days))
+            if png_path:
+                screenshot(page, png_path)
+                print("screenshot: {}".format(png_path))
+            if stale:
+                say("voyage-calendar: {} of {} feed(s) served from cache".format(stale, len(sources)),
+                    file=sys.stderr)
+            return 0
+        work = tempfile.mkdtemp(prefix="voyage-calendar-")
+        try:
+            png = screenshot(page, png_path or os.path.join(work, "dash.png"))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        kindle(host, REMOTE_SHOW, png)
+        total = sum(len(rows) for _, rows in days)
+        say("{}: painted {} event{} over {} days{}".format(
+            host, total, "" if total == 1 else "s", DAYS,
+            " ({} of {} feeds from cache)".format(stale, len(sources)) if stale else ""))
+    except CalendarError as exc:
+        say("voyage-calendar: {}".format(exc), file=sys.stderr)
+        return exc.exit_code
+    return 0
+
+
+# --- tests ------------------------------------------------------------------
+
+def _test():
+    # The agenda and the page render in the process's local zone, and the
+    # fixtures below are written for Los Angeles: pin the zone so the suite
+    # passes on a UTC runner (CI, a container). tzset() is what makes a TZ
+    # change visible to localtime(); a build without it needs TZ in the
+    # environment before start.
+    os.environ["TZ"] = "America/Los_Angeles"
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+    failures = []
+
+    def check(name, cond, detail=""):
+        print(("ok   " if cond else "FAIL ") + name + (" " + str(detail) if not cond else ""))
+        if not cond:
+            failures.append(name)
+
+    la = zone("America/Los_Angeles")
+    check("zoneinfo resolves a TZID", la is not None or zoneinfo is None)
+
+    def wall(instances, tz=la):
+        out = []
+        for i in instances:
+            if i.all_day:
+                out.append(i.start.isoformat())
+            else:
+                out.append(i.start.astimezone(tz).strftime("%Y-%m-%dT%H:%M"))
+        return out
+
+    def feed(*events):
+        body = "\n".join("BEGIN:VEVENT\n{}\nEND:VEVENT".format(e.strip()) for e in events)
+        return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n{}\r\nEND:VCALENDAR\r\n".format(body.replace("\n", "\r\n"))
+
+    def window(start, days=DAYS):
+        ws = localize(dt.datetime.strptime(start, "%Y-%m-%d"), la)
+        return ws, ws + dt.timedelta(days=days)
+
+    def run(text, start="2026-09-03", days=DAYS, email=None):
+        events, overrides = load_events(parse_components(text))
+        return expand(events, overrides, *window(start, days), email=email)
+
+    # parsing
+    check("unfold joins continuation lines",
+          unfold("SUMMARY:one\r\n  two\r\nX:y") == ["SUMMARY:one two", "X:y"])
+    check("params parsed and quotes respected",
+          parse_line('DTSTART;TZID="America/Los_Angeles";VALUE=DATE-TIME:20260903T090000')
+          == ("DTSTART", {"TZID": "America/Los_Angeles", "VALUE": "DATE-TIME"}, "20260903T090000"))
+    check("text escapes", unescape_text(r"a\, b\; c\nd\\e") == "a, b; c\nd\\e")
+    check("duration", parse_duration("P1DT2H30M") == dt.timedelta(days=1, hours=2, minutes=30)
+          and parse_duration("-PT15M") == dt.timedelta(minutes=-15) and parse_duration("P2W") == dt.timedelta(weeks=2))
+    check("rrule lists", parse_rrule("FREQ=WEEKLY;BYDAY=mo,WE;INTERVAL=2")
+          == {"FREQ": "WEEKLY", "BYDAY": ["MO", "WE"], "INTERVAL": "2"})
+    check("VALARM stays out of the event", len(parse_components(
+        feed("UID:a\nDTSTART:20260903T170000Z\nBEGIN:VALARM\nTRIGGER:-PT10M\nEND:VALARM\nSUMMARY:x"))[0]) == 3)
+
+    # single events, zones, all-day
+    single = feed("UID:s\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nDTEND;TZID=America/Los_Angeles:20260903T093000\nSUMMARY:Standup")
+    inst = run(single)
+    check("timed event lands on its LA wall clock", wall(inst) == ["2026-09-03T09:00"], wall(inst))
+    check("duration from DTEND", inst[0].end - inst[0].start == dt.timedelta(minutes=30))
+    utc = run(feed("UID:u\nDTSTART:20260903T160000Z\nDTEND:20260903T170000Z\nSUMMARY:UTC"))
+    check("UTC event converts (16:00Z is 9:00 PDT)", wall(utc) == ["2026-09-03T09:00"], wall(utc))
+    allday = run(feed("UID:d\nDTSTART;VALUE=DATE:20260904\nDTEND;VALUE=DATE:20260906\nSUMMARY:Trip"))
+    check("all-day keeps dates, end exclusive", allday and allday[0].all_day
+          and (allday[0].start, allday[0].end) == (dt.date(2026, 9, 4), dt.date(2026, 9, 6)), allday)
+    check("event outside the window is dropped",
+          run(feed("UID:o\nDTSTART;TZID=America/Los_Angeles:20260915T090000\nSUMMARY:Later")) == [])
+    check("event straddling the window start is kept", wall(run(feed(
+        "UID:x\nDTSTART;TZID=America/Los_Angeles:20260902T230000\nDTEND;TZID=America/Los_Angeles:20260903T010000\nSUMMARY:Late")))
+        == ["2026-09-02T23:00"])
+    check("cancelled event skipped",
+          run(feed("UID:c\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nSTATUS:CANCELLED\nSUMMARY:x")) == [])
+    declined = feed("UID:i\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nSUMMARY:Invite\n"
+                    "ATTENDEE;PARTSTAT=DECLINED;CN=Me:mailto:Me@Example.com\nATTENDEE;PARTSTAT=ACCEPTED:mailto:o@x.com")
+    check("declined invitation skipped for my address", run(declined, email="me@example.com") == [])
+    check("declined by someone else still shown", len(run(declined, email="o@x.com")) == 1)
+    check("no address configured: shown", len(run(declined)) == 1)
+
+    # recurrence
+    daily = feed("UID:r\nDTSTART;TZID=America/Los_Angeles:20260101T080000\nDTEND;TZID=America/Los_Angeles:20260101T081500\nRRULE:FREQ=DAILY;INTERVAL=2\nSUMMARY:Alt")
+    got = wall(run(daily, days=4))
+    check("daily interval 2 from a distant start", got == ["2026-09-04T08:00", "2026-09-06T08:00"], got)
+    weekly = feed("UID:w\nDTSTART;TZID=America/Los_Angeles:20260825T100000\nRRULE:FREQ=WEEKLY;BYDAY=TU,TH;INTERVAL=2;WKST=SU\nSUMMARY:Biweekly")
+    got = wall(run(weekly, days=14))
+    check("weekly BYDAY with interval and WKST", got == ["2026-09-08T10:00", "2026-09-10T10:00"], got)
+    exdated = feed("UID:e\nDTSTART;TZID=America/Los_Angeles:20260827T100000\nRRULE:FREQ=WEEKLY\n"
+                   "EXDATE;TZID=America/Los_Angeles:20260903T100000\nSUMMARY:Weekly")
+    got = wall(run(exdated, days=8))
+    check("EXDATE removes an instance", got == ["2026-09-10T10:00"], got)
+    exdated_utc = feed("UID:e2\nDTSTART;TZID=America/Los_Angeles:20260827T100000\nRRULE:FREQ=WEEKLY\n"
+                       "EXDATE:20260903T170000Z\nSUMMARY:Weekly")
+    check("EXDATE written in UTC still matches", wall(run(exdated_utc, days=8)) == ["2026-09-10T10:00"])
+    monthly = feed("UID:m\nDTSTART;TZID=America/Los_Angeles:20260108T120000\nRRULE:FREQ=MONTHLY;BYDAY=2TH\nSUMMARY:2nd Thu")
+    got = wall(run(monthly, days=14))
+    check("monthly ordinal BYDAY", got == ["2026-09-10T12:00"], got)
+    lastfri = feed("UID:lf\nDTSTART;TZID=America/Los_Angeles:20260130T120000\nRRULE:FREQ=MONTHLY;BYDAY=-1FR\nSUMMARY:Last Fri")
+    got = wall(run(lastfri, start="2026-09-21", days=7))
+    check("monthly -1FR", got == ["2026-09-25T12:00"], got)
+    monthday = feed("UID:md\nDTSTART;TZID=America/Los_Angeles:20260131T090000\nRRULE:FREQ=MONTHLY\nSUMMARY:31st")
+    check("monthly on the 31st skips short months", wall(run(monthday, start="2026-09-28", days=7)) == []
+          and wall(run(monthday, start="2026-10-28", days=7)) == ["2026-10-31T09:00"])
+    yearly = feed("UID:y\nDTSTART;VALUE=DATE:19900905\nDTEND;VALUE=DATE:19900906\nRRULE:FREQ=YEARLY\nSUMMARY:Birthday")
+    got = wall(run(yearly))
+    check("yearly all-day", got == ["2026-09-05"], got)
+    counted = feed("UID:n\nDTSTART;TZID=America/Los_Angeles:20260901T090000\nRRULE:FREQ=DAILY;COUNT=3\nSUMMARY:Three")
+    got = wall(run(counted))
+    check("COUNT bounds the series", got == ["2026-09-03T09:00"], got)
+    until = feed("UID:t\nDTSTART;TZID=America/Los_Angeles:20260901T090000\nRRULE:FREQ=DAILY;UNTIL=20260904T160000Z\nSUMMARY:Until")
+    got = wall(run(until))
+    check("UNTIL in UTC is inclusive on the wall clock", got == ["2026-09-03T09:00", "2026-09-04T09:00"], got)
+    until_date = feed("UID:td\nDTSTART;VALUE=DATE:20260901\nRRULE:FREQ=DAILY;UNTIL=20260904\nSUMMARY:Days")
+    got = wall(run(until_date))
+    check("UNTIL date for an all-day series", got == ["2026-09-03", "2026-09-04"], got)
+    moved = feed("UID:v\nDTSTART;TZID=America/Los_Angeles:20260827T100000\nRRULE:FREQ=WEEKLY\nSUMMARY:Sync",
+                 "UID:v\nRECURRENCE-ID;TZID=America/Los_Angeles:20260903T100000\n"
+                 "DTSTART;TZID=America/Los_Angeles:20260904T150000\nSUMMARY:Sync (moved)")
+    got = [(w, i.title) for w, i in zip(wall(run(moved, days=8)), run(moved, days=8))]
+    check("RECURRENCE-ID override replaces the instance",
+          got == [("2026-09-04T15:00", "Sync (moved)"), ("2026-09-10T10:00", "Sync")], got)
+    cancelled_one = feed("UID:v2\nDTSTART;TZID=America/Los_Angeles:20260827T100000\nRRULE:FREQ=WEEKLY\nSUMMARY:Sync",
+                         "UID:v2\nRECURRENCE-ID;TZID=America/Los_Angeles:20260903T100000\n"
+                         "DTSTART;TZID=America/Los_Angeles:20260903T100000\nSTATUS:CANCELLED\nSUMMARY:Sync")
+    check("cancelled override drops just that instance", wall(run(cancelled_one, days=8)) == ["2026-09-10T10:00"])
+    rdate = feed("UID:rd\nDTSTART;TZID=America/Los_Angeles:20260801T100000\nRRULE:FREQ=MONTHLY\n"
+                 "RDATE;TZID=America/Los_Angeles:20260905T100000\nSUMMARY:Extra")
+    check("RDATE adds an instance", wall(run(rdate)) == ["2026-09-05T10:00"])
+    unsupported = feed("UID:h\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nRRULE:FREQ=HOURLY;COUNT=5\nSUMMARY:Hourly")
+    check("unsupported FREQ yields the start only", wall(run(unsupported)) == ["2026-09-03T09:00"])
+    dst = feed("UID:dst\nDTSTART;TZID=America/Los_Angeles:20260302T090000\nRRULE:FREQ=WEEKLY\nSUMMARY:Mon 9am")
+    check("weekly keeps its wall clock across DST",
+          all(w.endswith("T09:00") for w in wall(run(dst, start="2026-11-02", days=7))))
+
+    # agenda rows
+    now = localize(dt.datetime(2026, 9, 3, 12, 0), la)
+    rows_feed = feed("UID:1\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nDTEND;TZID=America/Los_Angeles:20260903T093000\nSUMMARY:Past",
+                     "UID:2\nDTSTART;TZID=America/Los_Angeles:20260903T113000\nDTEND;TZID=America/Los_Angeles:20260903T123000\nSUMMARY:Now",
+                     "UID:3\nDTSTART;TZID=America/Los_Angeles:20260903T220000\nDTEND;TZID=America/Los_Angeles:20260904T010000\nSUMMARY:Overnight",
+                     "UID:4\nDTSTART;VALUE=DATE:20260902\nDTEND;VALUE=DATE:20260905\nSUMMARY:Trip",
+                     "UID:5\nDTSTART;TZID=America/Los_Angeles:20260903T140000\nSUMMARY:Reminder")
+    inst = run(rows_feed)
+    days = agenda(inst, dt.date(2026, 9, 3), now)
+    today_rows = [(r[0], r[1], r[2]) for r in days[0][1]]
+    check("today's rows: all-day first, then by time, with states", today_rows == [
+        ("Day 2 of 3", "Trip", "allday"), ("9:00 – 9:30 AM", "Past", "past"),
+        ("11:30 AM – 12:30 PM", "Now", "now"), ("2:00 PM", "Reminder", "later"),
+        ("10:00 PM →", "Overnight", "later")], today_rows)
+    tomorrow_rows = [(r[0], r[1]) for r in days[1][1]]
+    check("overnight continues into tomorrow", tomorrow_rows == [("Day 3 of 3", "Trip"), ("→ 1:00 AM", "Overnight")],
+          tomorrow_rows)
+    check("agenda spans DAYS days", len(days) == DAYS and days[-1][0] == dt.date(2026, 9, 9))
+    text = agenda_text(days)
+    check("text agenda marks the running event", "▶ 11:30 AM – 12:30 PM  Now" in text, text)
+
+    page = render_html(days, now, stale_feeds=1, feed_count=2)
+    check("page names today and the events", "Thursday" in page and "Overnight" in page and "Trip" in page)
+    check("past rows collapse into the Earlier line", "Earlier</span>Past</div>" in page and 'row past' not in page)
+    check("today's running row has a two-line time", "<b>11:30 AM</b><small>– 12:30 PM</small>" in page)
+    check("page flags a stale feed", "1 of 2 calendars from cache" in page)
+    check("month grid marks today", 'class="today"><span>3</span>' in page)
+    check("html escaped", "&lt;" in render_html(agenda(run(feed(
+        "UID:h\nDTSTART;TZID=America/Los_Angeles:20260903T090000\nSUMMARY:<b>")), dt.date(2026, 9, 3), now), now))
+    many = feed(*["UID:{0}\nDTSTART;TZID=America/Los_Angeles:2026090{1}T{2:02d}0000\nSUMMARY:E{0}".format(
+        i, 3 + i % 6, 6 + i % 12) for i in range(60)])
+    crowded = render_html(agenda(run(many), dt.date(2026, 9, 3), now), now)
+    check("crowded week gets '+N more' rows instead of overflowing", "more</div>" in crowded)
+    check("crowded week says how far the page got", "through " in crowded and "not shown" in crowded)
+    wide = render_html(days, now, landscape=True)
+    check("landscape page rotates and splits into columns",
+          'class="landscape"' in wide and 'class="left"' in wide and "Overnight" in wide)
+    check("no day heading is printed without at least one row", "</h3><div class=\"more\">" not in crowded)
+
+    check("feed URL redacted in logs", redact("https://calendar.google.com/calendar/ical/x/private-abc/basic.ics")
+          == "https://calendar.google.com/…")
+    try:
+        feed_sources({})
+        check("no feeds raises", False)
+    except CalendarError as exc:
+        check("no feeds raises exit 3", exc.exit_code == 3)
+    check("feed sources split on whitespace", feed_sources({"VOYAGE_CALENDAR_ICS_URLS": "a\n b"}) == ["a", "b"])
+    for name, script in (("keeper", KEEPER_SH), ("show", REMOTE_SHOW), ("restore", REMOTE_RESTORE)):
+        proc = subprocess.run(["sh", "-n"], input=script.encode(), capture_output=True)
+        check("remote {} script parses as sh".format(name), proc.returncode == 0, proc.stderr.decode())
+    check("push ships the keeper verbatim", KEEPER_SH in REMOTE_SHOW and "<<'KEEPER'" in REMOTE_SHOW)
+    os.environ.pop("VOYAGE_CALENDAR_SSH_KEY", None)
+    check("ssh logs in as root by default", ssh_command("voyage")[-1] == "root@voyage"
+          and ssh_command("me@10.0.0.9")[-1] == "me@10.0.0.9" and "-i" not in ssh_command("voyage"))
+    os.environ["VOYAGE_CALENDAR_SSH_KEY"] = "/ssh/key"
+    keyed = ssh_command("voyage")
+    check("ssh with a key offers only it and pins the host key under the cache",
+          keyed[keyed.index("-i") + 1] == "/ssh/key" and "IdentitiesOnly=yes" in keyed
+          and "UserKnownHostsFile=" + os.path.join(CACHE_DIR, "known_hosts") in keyed)
+    del os.environ["VOYAGE_CALENDAR_SSH_KEY"]
+
+    if chrome_binary():
+        work = tempfile.mkdtemp(prefix="voyage-calendar-test-")
+        try:
+            png = screenshot(page, os.path.join(work, "t.png"))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        size = (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
+        check("Chrome renders the panel size", png[:8] == b"\x89PNG\r\n\x1a\n" and size == (WIDTH, HEIGHT), size)
+    else:
+        print("skip Chrome screenshot (no Chrome or Chromium found)")
+
+    print("{} failure(s)".format(len(failures)) if failures else "all passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--test"]:
+        sys.exit(_test())
+    sys.exit(main(sys.argv[1:]))

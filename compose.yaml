@@ -1,0 +1,9 @@
+services:
+  voyage-calendar:
+    image: ghcr.io/junzh0u/voyage-calendar:latest
+    command: ["--every", "600", "--landscape"]
+    env_file: .env
+    volumes:
+      - ./cache:/cache            # last good copy of each feed, the Kindle's host key
+      - ./kindle_voyage:/ssh/kindle_voyage:ro
+    restart: unless-stopped
