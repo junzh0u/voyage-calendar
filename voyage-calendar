@@ -87,8 +87,9 @@ except ImportError:  # Python 3.8: TZIDs fall back to the local zone
 
 WIDTH, HEIGHT = 1072, 1448  # the Voyage's panel, portrait
 DAYS = 7  # today plus the week ahead
+# chromium-browser last: on Ubuntu it is a snap stub that only prints an error
 CHROME_CANDIDATES = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                     "chromium", "chromium-browser", "google-chrome", "google-chrome-stable")
+                     "chromium", "google-chrome", "google-chrome-stable", "chromium-browser")
 CACHE_DIR = os.environ.get("VOYAGE_CALENDAR_CACHE_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "voyage-calendar")
 REMOTE_DIR = "/mnt/us/voyage-calendar"
@@ -906,7 +907,7 @@ def screenshot(html_text, png_path, timeout=45):
         shutil.rmtree(work, ignore_errors=True)
         raise CalendarError("could not run Chrome: {}".format(exc))
     deadline = time.time() + timeout
-    written = False
+    written, last_line = False, b""
     try:
         while time.time() < deadline:
             ready, _, _ = select.select([proc.stderr], [], [], 0.5)
@@ -914,6 +915,7 @@ def screenshot(html_text, png_path, timeout=45):
                 line = proc.stderr.readline()
                 if not line:
                     break
+                last_line = line.strip() or last_line
                 if b"written to file" in line:
                     written = True
                     break
@@ -928,7 +930,8 @@ def screenshot(html_text, png_path, timeout=45):
                 proc.kill()
         shutil.rmtree(work, ignore_errors=True)
     if not written and not (os.path.exists(png_path) and os.path.getsize(png_path)):
-        raise CalendarError("Chrome produced no screenshot within {}s".format(timeout))
+        raise CalendarError("{} produced no screenshot within {}s{}".format(
+            chrome, timeout, ": " + last_line.decode("utf-8", "replace") if last_line else ""))
     with open(png_path, "rb") as fh:
         return fh.read()
 
