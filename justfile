@@ -11,9 +11,22 @@ check:
 fix:
     uvx ruff check --fix voyage-calendar
 
-# Render from this checkout and paint the Kindle once, with the feeds, host
-# and TZ from .env. ssh needs a ~/.ssh/config entry for that host carrying
-# the Kindle's key. The container (compose.yaml) keeps repainting from its
-# image every 10 minutes, so a local push only previews an unreleased layout.
+# Install the launch agent (launchd.plist) that paints the Kindle from this
+# checkout at login and every 10 minutes, with .env, kindle_voyage and cache/
+# beside it; it logs to ~/Library/Logs/voyage-calendar.log. Rerun after
+# moving the checkout or editing the plist.
+install:
+    #!/bin/sh
+    set -eu
+    label=io.github.junzh0u.voyage-calendar
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    sed -e "s|@DIR@|{{ justfile_directory() }}|g" -e "s|@HOME@|$HOME|g" launchd.plist > "$plist"
+    plutil -lint -s "$plist"
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    echo "loaded $label; tail -f ~/Library/Logs/voyage-calendar.log"
+
+# Paint the Kindle once now from this checkout, with the same .env, key and
+# cache as the launch agent, instead of waiting for its next round
 push *args:
-    ./voyage-calendar --landscape {{ args }}
+    VOYAGE_CALENDAR_SSH_KEY=kindle_voyage VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --landscape {{ args }}

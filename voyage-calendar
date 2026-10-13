@@ -14,9 +14,10 @@ suspends the device, and after the wake nothing else would reconnect it.
 `--restore` undoes all of it; a reboot brings the reader back on its own and
 the next push re-applies the kiosk.
 
-Meant to run as a container (Dockerfile and compose.yaml alongside) that
-repaints every 10 minutes with `--every 600`; a bare `python3 voyage-calendar`
-works anywhere with Chrome or Chromium and an ssh client.
+Meant to run on a Mac as a launch agent (launchd.plist, loaded by `just
+install`) that paints once every 10 minutes from the checkout; it works
+anywhere with Python 3, Chrome or Chromium, and an ssh client, and `--every
+600` repeats it without a scheduler.
 
 Configuration comes from the environment (a feed URL is a credential: anyone
 holding it reads the calendar):
@@ -30,7 +31,7 @@ holding it reads the calendar):
   VOYAGE_CALENDAR_SSH_KEY    optional: private key for the Kindle. With it set,
                              ssh offers only that key and keeps the Kindle's
                              host key under the cache directory, so no ssh
-                             config or known_hosts is needed (a container)
+                             config or known_hosts is needed
   VOYAGE_CALENDAR_CHROME     optional: the Chrome or Chromium binary (default:
                              Google Chrome on macOS, else chromium or
                              google-chrome on PATH)
@@ -556,12 +557,12 @@ def sort_key(value):
 # --- feeds ---------------------------------------------------------------------
 
 def feed_sources(env=os.environ):
-    # Quotes around the list keep dotenv parsers happy (compose strips them,
-    # `docker run --env-file` does not).
+    # .env quotes the list so sh can source it; a dotenv loader may keep the
+    # quotes.
     urls = (env.get("VOYAGE_CALENDAR_ICS_URLS") or "").strip().strip("\"'").split()
     if not urls:
         raise CalendarError("VOYAGE_CALENDAR_ICS_URLS must list at least one iCal feed "
-                            "(see .zshenv.secret)", 3)
+                            "(see env.example)", 3)
     return urls
 
 
@@ -903,7 +904,7 @@ def screenshot(html_text, png_path, timeout=45):
             "--user-data-dir=" + os.path.join(work, "profile"),
             "--screenshot=" + png_path, "file://" + html_path]
     if hasattr(os, "geteuid") and os.geteuid() == 0:
-        args.append("--no-sandbox")  # Chromium refuses to sandbox as root, which is what a container runs it as
+        args.append("--no-sandbox")  # Chromium refuses to sandbox as root
     try:
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except OSError as exc:
@@ -1076,7 +1077,7 @@ def run(rest, png_path, html_path):
 def _test():
     # The agenda and the page render in the process's local zone, and the
     # fixtures below are written for Los Angeles: pin the zone so the suite
-    # passes on a UTC runner (CI, a container). tzset() is what makes a TZ
+    # passes on a UTC runner (CI). tzset() is what makes a TZ
     # change visible to localtime(); a build without it needs TZ in the
     # environment before start.
     os.environ["TZ"] = "America/Los_Angeles"

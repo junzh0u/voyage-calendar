@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The macOS launch agent `just install` fills in (@DIR@: this checkout,
+     @HOME@: your home) and loads: one push at login and every 10 minutes,
+     with .env, kindle_voyage and cache/ read from the checkout. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.junzh0u.voyage-calendar</string>
+	<key>WorkingDirectory</key>
+	<string>@DIR@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>set -a; . ./.env; set +a; exec ./voyage-calendar --landscape</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>VOYAGE_CALENDAR_SSH_KEY</key>
+		<string>@DIR@/kindle_voyage</string>
+		<key>VOYAGE_CALENDAR_CACHE_DIR</key>
+		<string>@DIR@/cache</string>
+		<key>LOG_TIMESTAMP</key>
+		<string>1</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>@HOME@/Library/Logs/voyage-calendar.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/voyage-calendar.log</string>
+</dict>
+</plist>
