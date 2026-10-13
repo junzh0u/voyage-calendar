@@ -58,8 +58,11 @@ Modes:
   --every SECS  repeat the default mode forever, SECS apart; a failed round
                 is logged and the next one tried
   -n, --dry-run fetch and render; print the agenda as text instead of pushing
-  --landscape   two columns for a Kindle on its side (top edge to the right):
-                weekday, month and today on the left, the week on the right
+  --rotate DEG  how far the Kindle is turned clockwise from upright: 0 (the
+                default) or 180 keep the one-column portrait page, 90 (top
+                edge to the right) or 270 (top edge to the left) switch to two
+                columns — weekday, month and today on the left, the week on
+                the right
   --png PATH    also save the rendered screenshot to PATH
   --html PATH   also save the rendered page to PATH (to iterate on the layout)
   --restore     hand the Kindle back to the reader UI (start the framework,
@@ -69,6 +72,7 @@ Modes:
 Exit codes: 0 ok · 1 fetch, render, or push failed · 3 no feed configured
 """
 import calendar
+import contextlib
 import datetime as dt
 import hashlib
 import html
@@ -678,7 +682,8 @@ MORE_PX = 40
 # portrait: header (weekday, date, month grid) above one column
 PORTRAIT_PAGE_PX = HEIGHT - 44 - 36
 PORTRAIT_HEADER_PX = 320
-# landscape (the page drawn 1448x1072 and rotated onto the portrait panel):
+# landscape, --rotate 90 or 270 (the page drawn 1448x1072 and turned onto the
+# portrait panel):
 # weekday, date, month grid and today in the left column, the week in the right
 LANDSCAPE_PAGE_PX = WIDTH - 40 - 32
 LANDSCAPE_LEFT_HEADER_PX = 470
@@ -788,7 +793,10 @@ def footer_html(now, days, shown_through, hidden, stale_feeds, feed_count):
     return '<footer><span>Updated {}</span><span>{}</span></footer>'.format(clock(now), esc(" · ".join(notes)))
 
 
-def render_html(days, now, stale_feeds=0, feed_count=1, landscape=False):
+def render_html(days, now, stale_feeds=0, feed_count=1, rotate=0):
+    """rotate: how far the Kindle is turned clockwise (ROTATIONS); the page
+    turns the other way so it reads upright."""
+    landscape = rotate in (90, 270)
     today, today_rows = days[0]
     header = '<div class="head"><div class="weekday">{}</div><div class="date">{}</div></div>'.format(
         today.strftime("%A"), today.strftime("%B %-d, %Y"))
@@ -807,7 +815,7 @@ def render_html(days, now, stale_feeds=0, feed_count=1, landscape=False):
             header, grid, today_part, week_part,
             footer_html(now, days, shown_through, hidden, stale_feeds, feed_count))
     return '<!doctype html><meta charset="utf-8"><title>voyage-calendar</title><style>{}</style><body class="{}">{}'.format(
-        CSS, "landscape" if landscape else "portrait", body)
+        CSS, "{} r{}".format("landscape" if landscape else "portrait", rotate), body)
 
 
 CSS = """
@@ -847,10 +855,12 @@ h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacin
 .more { font-size: 28px; color: #666; padding: 6px 0; }
 footer { margin-top: auto; display: flex; justify-content: space-between; font-size: 24px; color: #777; padding-top: 10px; }
 
-/* landscape: drawn %(h)dx%(w)d, then turned a quarter counterclockwise onto
-   the portrait panel — hold the Kindle with its top edge to the right */
-.landscape .page { width: %(h)dpx; height: %(w)dpx; padding: 40px 48px 32px; transform-origin: top left;
-  transform: translate(0, %(h)dpx) rotate(-90deg); }
+/* --rotate: the page turns against the Kindle so it reads upright. Landscape
+   is drawn %(h)dx%(w)d and turned a quarter onto the portrait panel. */
+.r180 .page { transform: rotate(180deg); }
+.landscape .page { width: %(h)dpx; height: %(w)dpx; padding: 40px 48px 32px; transform-origin: top left; }
+.r90 .page { transform: translate(0, %(h)dpx) rotate(-90deg); }
+.r270 .page { transform: translate(%(w)dpx, 0) rotate(90deg); }
 .landscape .cols { display: flex; flex: 1; min-height: 0; }
 .landscape .left { flex: 0 0 520px; min-width: 0; padding-right: 44px; border-right: 6px solid #000; margin-right: 44px; display: flex; flex-direction: column; }
 .landscape .right { flex: 1; min-width: 0; }
@@ -987,10 +997,11 @@ def main(argv):
         print(__doc__.strip())
         return 0
     png_path = html_path = every = None
+    rotate = 0
     rest, args = [], list(argv)
     while args:
         arg = args.pop(0)
-        if arg in ("--png", "--html", "--every"):
+        if arg in ("--png", "--html", "--every", "--rotate"):
             if not args:
                 print("voyage-calendar: {} needs a value".format(arg), file=sys.stderr)
                 return 2
@@ -999,6 +1010,11 @@ def main(argv):
                 png_path = value
             elif arg == "--html":
                 html_path = value
+            elif arg == "--rotate":
+                if value not in ("0", "90", "180", "270"):
+                    print("voyage-calendar: --rotate takes 0, 90, 180 or 270", file=sys.stderr)
+                    return 2
+                rotate = int(value)
             else:
                 try:
                     every = int(value)
@@ -1009,9 +1025,9 @@ def main(argv):
                     return 2
         else:
             rest.append(arg)
-    flags = ("-n", "--dry-run", "--restore", "--landscape")
+    flags = ("-n", "--dry-run", "--restore")
     unknown = [arg for arg in rest if arg not in flags]
-    usage = ("usage: voyage-calendar [--landscape] [--png PATH] [--html PATH] [--every SECS] "
+    usage = ("usage: voyage-calendar [--rotate DEG] [--png PATH] [--html PATH] [--every SECS] "
              "[-n | --dry-run | --restore | --test | -h]")
     if unknown:
         print("voyage-calendar: invalid argument(s): {}".format(" ".join(unknown)), file=sys.stderr)
@@ -1022,14 +1038,14 @@ def main(argv):
         print(usage, file=sys.stderr)
         return 2
     if every is None:
-        return run(rest, png_path, html_path)
+        return run(rest, png_path, html_path, rotate)
     while True:
         started = time.time()
-        run(rest, png_path, html_path)
+        run(rest, png_path, html_path, rotate)
         time.sleep(max(0, every - (time.time() - started)))
 
 
-def run(rest, png_path, html_path):
+def run(rest, png_path, html_path, rotate=0):
     """One round of the mode in `rest`; the process exit code."""
     host = os.environ.get("VOYAGE_CALENDAR_HOST") or "voyage"
     dry_run = "-n" in rest or "--dry-run" in rest
@@ -1041,7 +1057,7 @@ def run(rest, png_path, html_path):
         sources = feed_sources()
         now = dt.datetime.now().astimezone()
         days, stale = build(sources, os.environ.get("VOYAGE_CALENDAR_EMAIL"), now)
-        page = render_html(days, now, stale, len(sources), landscape="--landscape" in rest)
+        page = render_html(days, now, stale, len(sources), rotate=rotate)
         if html_path:
             with open(html_path, "w", encoding="utf-8") as fh:
                 fh.write(page)
@@ -1238,9 +1254,14 @@ def _test():
     crowded = render_html(agenda(run(many), dt.date(2026, 9, 3), now), now)
     check("crowded week gets '+N more' rows instead of overflowing", "more</div>" in crowded)
     check("crowded week says how far the page got", "through " in crowded and "not shown" in crowded)
-    wide = render_html(days, now, landscape=True)
-    check("landscape page rotates and splits into columns",
-          'class="landscape"' in wide and 'class="left"' in wide and "Overnight" in wide)
+    wide = render_html(days, now, rotate=90)
+    check("--rotate 90 turns the page and splits it into columns",
+          'class="landscape r90"' in wide and 'class="left"' in wide and "Overnight" in wide)
+    check("--rotate 270 is landscape turned the other way", 'class="landscape r270"' in render_html(days, now, rotate=270))
+    check("--rotate 180 keeps the portrait page upside down", 'class="portrait r180"' in render_html(days, now, rotate=180))
+    with open(os.devnull, "w") as quiet, contextlib.redirect_stderr(quiet):
+        rejected = main(["--rotate", "45"])
+    check("--rotate rejects other angles", rejected == 2)
     check("no day heading is printed without at least one row", "</h3><div class=\"more\">" not in crowded)
 
     check("feed URL redacted in logs", redact("https://calendar.google.com/calendar/ical/x/private-abc/basic.ics")

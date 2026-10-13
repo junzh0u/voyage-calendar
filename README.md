@@ -2,7 +2,7 @@
 
 Turns a jailbroken Kindle Voyage into an always-on wall calendar for Google Calendar. A launch agent on a Mac fetches the calendars' secret iCal feeds every ten minutes, renders the coming week as a page sized for the Voyage's 300 ppi panel, screenshots it with headless Chrome, and pushes the image to the Kindle over SSH, where FBInk paints it.
 
-The layout: today in detail, the next days compact, the month grid, and a footer with the last update time. What is already over today collapses into one line so the rest keeps its room; a week that does not fit says how far it got. `--landscape` splits the page into two columns for a Kindle lying on its side, top edge to the right.
+The layout: today in detail, the next days compact, the month grid, and a footer with the last update time. What is already over today collapses into one line so the rest keeps its room; a week that does not fit says how far it got. `--rotate DEG` says how far the Kindle is turned clockwise from upright: 180 flips the portrait page, and 90 (top edge to the right) or 270 (top edge to the left) split it into two columns for a Kindle lying on its side.
 
 The push also turns the Kindle into a kiosk: the reader framework is stopped so nothing repaints over the calendar, the device is kept from sleeping, and a small keeper loop left on the Kindle brings Wi-Fi back whenever it drops. `--restore` hands the reader UI back; a reboot does the same on its own.
 
@@ -19,7 +19,7 @@ just install                                 # load the launch agent: one push n
 tail -f ~/Library/Logs/voyage-calendar.log
 ```
 
-The agent (`launchd.plist`, installed as `~/Library/LaunchAgents/io.github.junzh0u.voyage-calendar.plist`) runs `./voyage-calendar --landscape` from this checkout with the system Python and Google Chrome, so whatever is checked out is what the Kindle shows. Rerun `just install` after moving the checkout; `launchctl bootout gui/$(id -u)/io.github.junzh0u.voyage-calendar` stops it.
+The agent (`launchd.plist`, installed as `~/Library/LaunchAgents/io.github.junzh0u.voyage-calendar.plist`) runs `./voyage-calendar --rotate 90` from this checkout with the system Python and Google Chrome, so whatever is checked out is what the Kindle shows. Rerun `just install` after moving the checkout; `launchctl bootout gui/$(id -u)/io.github.junzh0u.voyage-calendar` stops it.
 
 The Kindle's host key is accepted on first contact and pinned under `cache/`, next to the last good copy of each feed, which serves when a fetch fails (the footer says so).
 
@@ -44,8 +44,8 @@ just push --restore
 `voyage-calendar` is one stdlib-only Python file; it needs Python 3, a Chrome or Chromium, and an ssh client. `--every 600` repaints forever without a scheduler. `./voyage-calendar --help` lists every variable and mode. It looks for Google Chrome on macOS, then `chromium` or `google-chrome` on `PATH`; without `VOYAGE_CALENDAR_SSH_KEY` it relies on your ssh config for the host.
 
 ```sh
-./voyage-calendar --dry-run --landscape --png out.png   # render without touching the Kindle
-./voyage-calendar --landscape                           # one push
+./voyage-calendar --dry-run --rotate 90 --png out.png   # render without touching the Kindle
+./voyage-calendar --rotate 90                           # one push
 ```
 
 ## Development

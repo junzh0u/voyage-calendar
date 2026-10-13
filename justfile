@@ -30,4 +30,4 @@ install:
 # Paint the Kindle once now from this checkout, with the same .env, key and
 # cache as the launch agent, instead of waiting for its next round
 push *args:
-    VOYAGE_CALENDAR_SSH_KEY="$HOME/.ssh/kindle_voyage" VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --landscape {{ args }}
+    VOYAGE_CALENDAR_SSH_KEY="$HOME/.ssh/kindle_voyage" VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --rotate 90 {{ args }}

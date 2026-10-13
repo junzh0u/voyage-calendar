@@ -14,7 +14,7 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>set -a; . ./.env; set +a; exec ./voyage-calendar --landscape</string>
+		<string>set -a; . ./.env; set +a; exec ./voyage-calendar --rotate 90</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
