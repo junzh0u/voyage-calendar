@@ -15,7 +15,6 @@ The push also turns the Kindle into a kiosk: the reader framework is stopped so 
 
 ```sh
 cp env.example .env                          # feed URLs, your address, the Kindle's address, TZ
-cp ~/.ssh/kindle_voyage .                    # the Kindle's private key
 just install                                 # load the launch agent: one push now and every 10 minutes
 tail -f ~/Library/Logs/voyage-calendar.log
 ```

@@ -2,7 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- The macOS launch agent `just install` fills in (@DIR@: this checkout,
      @HOME@: your home) and loads: one push at login and every 10 minutes,
-     with .env, kindle_voyage and cache/ read from the checkout. -->
+     with .env and cache/ read from the checkout and the Kindle's key from
+     ~/.ssh/kindle_voyage. -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -20,7 +21,7 @@
 		<key>PATH</key>
 		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>VOYAGE_CALENDAR_SSH_KEY</key>
-		<string>@DIR@/kindle_voyage</string>
+		<string>@HOME@/.ssh/kindle_voyage</string>
 		<key>VOYAGE_CALENDAR_CACHE_DIR</key>
 		<string>@DIR@/cache</string>
 		<key>LOG_TIMESTAMP</key>

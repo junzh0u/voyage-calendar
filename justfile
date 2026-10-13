@@ -12,9 +12,10 @@ fix:
     uvx ruff check --fix voyage-calendar
 
 # Install the launch agent (launchd.plist) that paints the Kindle from this
-# checkout at login and every 10 minutes, with .env, kindle_voyage and cache/
-# beside it; it logs to ~/Library/Logs/voyage-calendar.log. Rerun after
-# moving the checkout or editing the plist.
+# checkout at login and every 10 minutes, with .env and cache/ beside it and
+# the Kindle's key at ~/.ssh/kindle_voyage; it logs to
+# ~/Library/Logs/voyage-calendar.log. Rerun after moving the checkout or
+# editing the plist.
 install:
     #!/bin/sh
     set -eu
@@ -29,4 +30,4 @@ install:
 # Paint the Kindle once now from this checkout, with the same .env, key and
 # cache as the launch agent, instead of waiting for its next round
 push *args:
-    VOYAGE_CALENDAR_SSH_KEY=kindle_voyage VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --landscape {{ args }}
+    VOYAGE_CALENDAR_SSH_KEY="$HOME/.ssh/kindle_voyage" VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --landscape {{ args }}
