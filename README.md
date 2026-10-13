@@ -14,7 +14,7 @@ The push also turns the Kindle into a kiosk: the reader framework is stopped so 
 ## Run
 
 ```sh
-cp env.example .env                          # feed URLs, your address, the Kindle's address, TZ
+cp env.example .env                          # feed URLs, your address, the Kindle's address
 just install                                 # load the launch agent: one push now and every 10 minutes
 tail -f ~/Library/Logs/voyage-calendar.log
 ```
@@ -30,7 +30,7 @@ The variables in `.env`, sourced by `sh` (keep the feed list quoted) and read by
 | `VOYAGE_CALENDAR_ICS_URLS` | whitespace-separated secret iCal feed URLs (Google Calendar → Settings → the calendar → "Secret address in iCal format") |
 | `VOYAGE_CALENDAR_EMAIL` | optional: your address, so invitations you declined are dropped |
 | `VOYAGE_CALENDAR_HOST` | the Kindle's address, or `user@address` (the user defaults to `root`) |
-| `TZ` | the zone the agenda is rendered in |
+| `TZ` | optional: the zone the agenda is rendered in (default: the Mac's) |
 
 To give the Kindle back to the reader UI:
 
