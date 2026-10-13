@@ -821,9 +821,9 @@ header { display: flex; justify-content: space-between; align-items: flex-start;
 .month { border-collapse: collapse; }
 .month caption { font-size: 26px; font-weight: 700; text-align: right; padding-bottom: 6px; }
 .month th { font-size: 20px; font-weight: 600; color: #666; width: 44px; padding-bottom: 4px; text-transform: uppercase; }
-.month td { font-size: 26px; text-align: center; height: 42px; width: 44px; padding: 0; }
+.month td { font-size: 26px; font-weight: 700; text-align: center; height: 42px; width: 44px; padding: 0; }
 .month td span { display: inline-block; width: 40px; height: 40px; line-height: 40px; border-radius: 50%%; }
-.month td.today span { background: #000; color: #fff; font-weight: 700; }
+.month td.today span { background: #000; color: #fff; }
 .month td.gone { color: #aaa; }
 h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacing: 3px; color: #444; margin: 22px 0 6px; }
 .row { display: flex; align-items: baseline; padding: 10px 0; border-bottom: 2px solid #ddd; }
