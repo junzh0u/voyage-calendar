@@ -58,7 +58,7 @@ Modes:
   --every SECS  repeat the default mode forever, SECS apart; a failed round
                 is logged and the next one tried
   -n, --dry-run fetch and render; print the agenda as text instead of pushing
-  --landscape   two columns for a Kindle on its side (top edge to the left):
+  --landscape   two columns for a Kindle on its side (top edge to the right):
                 weekday, month and today on the left, the week on the right
   --png PATH    also save the rendered screenshot to PATH
   --html PATH   also save the rendered page to PATH (to iterate on the layout)
@@ -849,10 +849,10 @@ h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacin
 .more { font-size: 28px; color: #666; padding: 6px 0; }
 footer { margin-top: auto; display: flex; justify-content: space-between; font-size: 24px; color: #777; padding-top: 10px; }
 
-/* landscape: drawn %(h)dx%(w)d, then turned a quarter clockwise onto the
-   portrait panel — hold the Kindle with its top edge to the left */
+/* landscape: drawn %(h)dx%(w)d, then turned a quarter counterclockwise onto
+   the portrait panel — hold the Kindle with its top edge to the right */
 .landscape .page { width: %(h)dpx; height: %(w)dpx; padding: 40px 48px 32px; transform-origin: top left;
-  transform: translate(%(w)dpx, 0) rotate(90deg); }
+  transform: translate(0, %(h)dpx) rotate(-90deg); }
 .landscape .cols { display: flex; flex: 1; min-height: 0; }
 .landscape .left { flex: 0 0 520px; min-width: 0; padding-right: 44px; border-right: 6px solid #000; margin-right: 44px; display: flex; flex-direction: column; }
 .landscape .right { flex: 1; min-width: 0; }
