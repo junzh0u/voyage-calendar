@@ -1265,7 +1265,7 @@ def _test():
     check("text agenda marks the running event", "▶ 11:30 AM – 12:30 PM  Now" in text, text)
 
     page = render_html(days, now, stale_feeds=1, feed_count=2)
-    check("unlabelled rows carry no bar", "marked" not in page.split("</style>")[1])
+    check("unlabelled rows carry no briefcase", "marked" not in page.split("</style>")[1])
     for i in inst:
         if i.title in ("Now", "Overnight"):
             i.event.calendar = "work"
