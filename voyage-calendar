@@ -6,11 +6,13 @@ calendar → "Secret address in iCal format"), expands recurring events over the
 next 7 days, lays the agenda out as HTML — today in detail, the coming days
 compact, the month grid in the header — screenshots it with headless Chrome or
 Chromium at the Voyage's 1072x1448 (300 ppi), and pushes the PNG to the Kindle
-over SSH, where FBInk from the USBNetwork package paints it. The push also
-turns the Kindle into a kiosk: the reader framework is stopped so nothing
-repaints over the calendar, powerd is told not to sleep, and a keeper loop is
-left running that re-enables Wi-Fi whenever it drops — the power button still
-suspends the device, and after the wake nothing else would reconnect it.
+over SSH, where FBInk from the USBNetwork package paints it — with a
+flashing full refresh when the page changed, and in place without the flash
+when only its "Updated" time moved. The push also turns the Kindle into a
+kiosk: the reader framework is stopped so nothing repaints over the calendar,
+powerd is told not to sleep, and a keeper loop is left running that re-enables
+Wi-Fi whenever it drops — the power button still suspends the device, and
+after the wake nothing else would reconnect it.
 `--restore` undoes all of it; a reboot brings the reader back on its own and
 the next push re-applies the kiosk.
 
@@ -163,13 +165,27 @@ REMOTE_KEEPERS = """keepers() {
         case "$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)" in "sh $d/keeper.sh "*) echo ${p#/proc/};; esac
     done
 }"""
+# The push prefixes it with sum=<page_fingerprint>. A page that differs from
+# the last one painted gets a cleared, flashing refresh, which wipes e-ink
+# ghosting; one whose only change is the "Updated" clock is redrawn in place
+# without the flash. Taking over from the reader always flashes. It prints
+# "flashed" or "redrawn" for the log.
 REMOTE_SHOW = """
 export PATH=/mnt/us/usbnet/bin:/usr/sbin:/sbin:/usr/bin:/bin
 d={dir}
 mkdir -p $d && cat > $d/dash.png.new && mv -f $d/dash.png.new $d/dash.png || exit 10
-if pidof cvm >/dev/null 2>&1; then stop framework >/dev/null 2>&1 || exit 11; fi
+[ -n "$sum" ] && [ "$sum" = "$(cat $d/page.sum 2>/dev/null)" ] && same=1
+if pidof cvm >/dev/null 2>&1; then stop framework >/dev/null 2>&1 || exit 11; same=; fi
 lipc-set-prop com.lab126.powerd preventScreenSaver 1 || exit 12
-fbink -q -c -f -g file=$d/dash.png || exit 13
+if [ -n "$same" ]; then
+    fbink -q -W GC16 -g file=$d/dash.png || exit 13
+    echo redrawn
+else
+    rm -f $d/page.sum
+    fbink -q -c -f -g file=$d/dash.png || exit 13
+    echo flashed
+fi
+echo "$sum" > $d/page.sum
 cat > $d/keeper.sh.new <<'KEEPER'
 {keeper}KEEPER
 {keepers}
@@ -823,6 +839,13 @@ def upcoming_html(days, budget):
     return "".join(parts), shown_through, hidden
 
 
+def page_fingerprint(page):
+    """A digest of the page with its "Updated" clock left out: equal when
+    nothing but the time of the push changed."""
+    head, _, rest = page.partition("<footer><span>Updated ")
+    return hashlib.sha256((head + rest.partition("</span>")[2]).encode("utf-8")).hexdigest()
+
+
 def footer_html(now, days, shown_through, hidden, stale_feeds, feed_count):
     notes = []
     if shown_through != days[-1][0]:
@@ -1019,6 +1042,7 @@ def ssh_command(host):
 
 
 def kindle(host, script, stdin=b"", timeout=180):
+    """The script's stdout, stripped."""
     try:
         proc = subprocess.run(ssh_command(host) + [script], input=stdin, capture_output=True, timeout=timeout)
     except OSError as exc:
@@ -1031,6 +1055,7 @@ def kindle(host, script, stdin=b"", timeout=180):
         detail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise CalendarError("{} on {} failed (exit {}){}".format(
             step, host, proc.returncode, ": " + detail[-1] if detail else ""))
+    return proc.stdout.decode("utf-8", "replace").strip()
 
 
 # --- main --------------------------------------------------------------------
@@ -1137,10 +1162,10 @@ def run(rest, png_path, html_path, rotate=0):
             png = screenshot(page, png_path or os.path.join(work, "dash.png"))
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        kindle(host, REMOTE_SHOW, png)
+        refresh = kindle(host, "sum={}\n".format(page_fingerprint(page)) + REMOTE_SHOW, png)
         total = sum(len(rows) for _, rows in days)
-        say("{}: painted {} event{} over {} days{}".format(
-            host, total, "" if total == 1 else "s", DAYS,
+        say("{}: painted {} event{} over {} days{}{}".format(
+            host, total, "" if total == 1 else "s", DAYS, " ({})".format(refresh) if refresh else "",
             " ({} of {} feeds from cache)".format(stale, len(sources)) if stale else ""))
     except CalendarError as exc:
         say("voyage-calendar: {}".format(exc), file=sys.stderr)
@@ -1310,6 +1335,9 @@ def _test():
         if i.title in ("Now", "Overnight"):
             i.event.calendar = "work"
     marked = render_html(days, now)
+    check("the fingerprint ignores the Updated clock but not the events",
+          page_fingerprint(marked) == page_fingerprint(render_html(days, now + dt.timedelta(minutes=10)))
+          and page_fingerprint(marked) != page_fingerprint(page) and "Updated " in page)
     check("a weekday leaves its work rows unmarked",
           'class="row now"' in marked and "marked work" not in marked.split("</style>")[1])
     check("each day's name carries its theme", '<div class="date themed work">September 3' in page
