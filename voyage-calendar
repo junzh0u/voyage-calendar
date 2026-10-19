@@ -17,9 +17,10 @@ after the wake nothing else would reconnect it.
 the next push re-applies the kiosk.
 
 Meant to run on a Mac as a launch agent (launchd.plist, loaded by `just
-install`) that paints once every 10 minutes from the checkout; it works
-anywhere with Python 3, Chrome or Chromium, and an ssh client, and `--every
-600` repeats it without a scheduler.
+install`) that checks every minute from the checkout and paints when the page
+changed, or on the hour to move its "Updated" time; it works anywhere with
+Python 3, Chrome or Chromium, and an ssh client, and `--every 60
+--heartbeat 60` repeats it without a scheduler.
 
 Configuration comes from the environment (a feed URL is a credential: anyone
 holding it reads the calendar):
@@ -71,6 +72,12 @@ Modes:
   (default)     fetch, render, push to the Kindle, and paint
   --every SECS  repeat the default mode forever, SECS apart; a failed round
                 is logged and the next one tried
+  --heartbeat MINS
+                push a page only when it differs from the last one pushed
+                (beyond its "Updated" time), or on the heartbeat: the minutes
+                of the day that are a multiple of MINS (60: on the hour),
+                which push regardless and so keep the time current; meant
+                for frequent rounds
   -n, --dry-run fetch and render; print the agenda as text instead of pushing
   --rotate DEG  how far the Kindle is turned clockwise from upright: 0 (the
                 default) or 180 keep the one-column portrait page, 90 (top
@@ -1083,12 +1090,12 @@ def main(argv):
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0
-    png_path = html_path = every = None
+    png_path = html_path = every = heartbeat = None
     rotate = 0
     rest, args = [], list(argv)
     while args:
         arg = args.pop(0)
-        if arg in ("--png", "--html", "--every", "--rotate"):
+        if arg in ("--png", "--html", "--every", "--heartbeat", "--rotate"):
             if not args:
                 print("voyage-calendar: {} needs a value".format(arg), file=sys.stderr)
                 return 2
@@ -1104,17 +1111,22 @@ def main(argv):
                 rotate = int(value)
             else:
                 try:
-                    every = int(value)
-                    if every <= 0:
+                    number = int(value)
+                    if number <= 0:
                         raise ValueError
                 except ValueError:
-                    print("voyage-calendar: --every needs a positive number of seconds", file=sys.stderr)
+                    print("voyage-calendar: {} needs a positive number of {}".format(
+                        arg, "seconds" if arg == "--every" else "minutes"), file=sys.stderr)
                     return 2
+                if arg == "--every":
+                    every = number
+                else:
+                    heartbeat = number
         else:
             rest.append(arg)
     flags = ("-n", "--dry-run", "--restore")
     unknown = [arg for arg in rest if arg not in flags]
-    usage = ("usage: voyage-calendar [--rotate DEG] [--png PATH] [--html PATH] [--every SECS] "
+    usage = ("usage: voyage-calendar [--rotate DEG] [--png PATH] [--html PATH] [--every SECS] [--heartbeat MINS] "
              "[-n | --dry-run | --restore | --test | -h]")
     if unknown:
         print("voyage-calendar: invalid argument(s): {}".format(" ".join(unknown)), file=sys.stderr)
@@ -1125,14 +1137,22 @@ def main(argv):
         print(usage, file=sys.stderr)
         return 2
     if every is None:
-        return run(rest, png_path, html_path, rotate)
+        return run(rest, png_path, html_path, rotate, heartbeat)
     while True:
         started = time.time()
-        run(rest, png_path, html_path, rotate)
+        run(rest, png_path, html_path, rotate, heartbeat)
         time.sleep(max(0, every - (time.time() - started)))
 
 
-def run(rest, png_path, html_path, rotate=0):
+def due(fingerprint, last, now, heartbeat):
+    """Whether this round pushes: always without --heartbeat, else when
+    the page differs from the last one pushed or the minute of the day falls
+    on the heartbeat, a multiple of its minutes."""
+    return (not heartbeat or fingerprint != last
+            or (now.hour * 60 + now.minute) % heartbeat == 0)
+
+
+def run(rest, png_path, html_path, rotate=0, heartbeat=None):
     """One round of the mode in `rest`; the process exit code."""
     host = os.environ.get("VOYAGE_CALENDAR_HOST") or "voyage"
     dry_run = "-n" in rest or "--dry-run" in rest
@@ -1157,12 +1177,26 @@ def run(rest, png_path, html_path, rotate=0):
                 say("voyage-calendar: {} of {} feed(s) served from cache".format(stale, len(sources)),
                     file=sys.stderr)
             return 0
+        fingerprint = page_fingerprint(page)
+        # what was last tried, not what last got through: a failed push is
+        # retried on the next scheduled minute, not every round until then
+        pushed = os.path.join(CACHE_DIR, "last-push")
+        try:
+            with open(pushed, encoding="utf-8") as fh:
+                last = fh.read().strip()
+        except OSError:
+            last = ""
+        if not due(fingerprint, last, now, heartbeat):
+            return 0
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(pushed, "w", encoding="utf-8") as fh:
+            fh.write(fingerprint)
         work = tempfile.mkdtemp(prefix="voyage-calendar-")
         try:
             png = screenshot(page, png_path or os.path.join(work, "dash.png"))
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        refresh = kindle(host, "sum={}\n".format(page_fingerprint(page)) + REMOTE_SHOW, png)
+        refresh = kindle(host, "sum={}\n".format(fingerprint) + REMOTE_SHOW, png)
         total = sum(len(rows) for _, rows in days)
         say("{}: painted {} event{} over {} days{}{}".format(
             host, total, "" if total == 1 else "s", DAYS, " ({})".format(refresh) if refresh else "",
@@ -1335,6 +1369,11 @@ def _test():
         if i.title in ("Now", "Overnight"):
             i.event.calendar = "work"
     marked = render_html(days, now)
+    at = dt.datetime(2026, 9, 3, 10, 0)
+    check("--heartbeat pushes a changed page at once and an unchanged one on schedule",
+          due("a", "a", at, None) and due("b", "a", at.replace(minute=7), 60)
+          and not due("a", "a", at.replace(minute=7), 60) and due("a", "a", at, 60)
+          and due("a", "a", at.replace(minute=20), 10) and not due("a", "a", at.replace(hour=11), 120))
     check("the fingerprint ignores the Updated clock but not the events",
           page_fingerprint(marked) == page_fingerprint(render_html(days, now + dt.timedelta(minutes=10)))
           and page_fingerprint(marked) != page_fingerprint(page) and "Updated " in page)

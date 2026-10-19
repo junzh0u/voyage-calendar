@@ -13,7 +13,8 @@ fix:
 
 # Install chrome-headless-shell (the renderer that leaves no Dock icon behind)
 # under ~/.cache/puppeteer, and the launch agent (launchd.plist) that paints
-# the Kindle from this checkout at login and every 10 minutes, with .env and
+# the Kindle from this checkout: it checks at login and every minute, and
+# pushes a changed page at once and an unchanged one on the hour, with .env and
 # cache/ beside it and the Kindle's key at ~/.ssh/kindle_voyage; it logs to
 # ~/Library/Logs/voyage-calendar.log. Rerun after moving the checkout or
 # editing the plist, or to update the headless shell.

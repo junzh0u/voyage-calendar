@@ -15,7 +15,7 @@ The push also turns the Kindle into a kiosk: the reader framework is stopped so 
 
 ```sh
 cp env.example .env                          # feed URLs, your address, the Kindle's address
-just install                                 # load the launch agent: one push now and every 10 minutes
+just install                                 # load the launch agent: a check now and every minute
 tail -f ~/Library/Logs/voyage-calendar.log
 ```
 
@@ -41,7 +41,7 @@ just push --restore
 
 ## Elsewhere
 
-`voyage-calendar` is one stdlib-only Python file; it needs Python 3, a Chrome or Chromium, and an ssh client. `--every 600` repaints forever without a scheduler. `./voyage-calendar --help` lists every variable and mode. It looks for Google Chrome on macOS, then `chromium` or `google-chrome` on `PATH`; without `VOYAGE_CALENDAR_SSH_KEY` it relies on your ssh config for the host.
+`voyage-calendar` is one stdlib-only Python file; it needs Python 3, a Chrome or Chromium, and an ssh client. `--every 60 --heartbeat 60` repaints forever without a scheduler, at once when the page changes and on the hour otherwise. `./voyage-calendar --help` lists every variable and mode. It looks for Google Chrome on macOS, then `chromium` or `google-chrome` on `PATH`; without `VOYAGE_CALENDAR_SSH_KEY` it relies on your ssh config for the host.
 
 ```sh
 ./voyage-calendar --dry-run --rotate 90 --png out.png   # render without touching the Kindle

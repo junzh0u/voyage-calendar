@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- The macOS launch agent `just install` fills in (@DIR@: this checkout,
-     @HOME@: your home) and loads: one push at login and every 10 minutes,
-     with .env and cache/ read from the checkout and the Kindle's key from
+     @HOME@: your home) and loads: a check at login and every minute that
+     pushes a changed page at once and an unchanged one on the hour, with
+     .env and cache/ read from the checkout and the Kindle's key from
      ~/.ssh/kindle_voyage. -->
 <plist version="1.0">
 <dict>
@@ -14,7 +15,7 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>set -a; . ./.env; set +a; exec ./voyage-calendar --rotate 90</string>
+		<string>set -a; . ./.env; set +a; exec ./voyage-calendar --rotate 90 --heartbeat 60</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -29,8 +30,9 @@
 		<key>PYTHONUNBUFFERED</key>
 		<string>1</string>
 	</dict>
-	<key>StartInterval</key>
-	<integer>600</integer>
+	<!-- no keys: every minute -->
+	<key>StartCalendarInterval</key>
+	<dict/>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>
