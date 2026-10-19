@@ -35,8 +35,13 @@ holding it reads the calendar):
                              host key under the cache directory, so no ssh
                              config or known_hosts is needed
   VOYAGE_CALENDAR_CHROME     optional: the Chrome or Chromium binary (default:
-                             Google Chrome on macOS, else chromium or
-                             google-chrome on PATH)
+                             the newest chrome-headless-shell under
+                             ~/.cache/puppeteer, which `just install` puts
+                             there, or one on PATH; else Google Chrome on
+                             macOS, else chromium or google-chrome on PATH.
+                             Prefer the headless shell on a Mac: every render
+                             with Google Chrome.app adds a Chrome icon to the
+                             Dock's recent apps)
   VOYAGE_CALENDAR_CACHE_DIR  optional: where the last good copy of each feed
                              lives (default: ~/.cache/voyage-calendar)
   LOG_TIMESTAMP              optional: set it to prefix every log line with
@@ -76,6 +81,7 @@ Exit codes: 0 ok · 1 fetch, render, or push failed · 3 no feed configured
 import calendar
 import contextlib
 import datetime as dt
+import glob
 import hashlib
 import html
 import os
@@ -95,8 +101,14 @@ except ImportError:  # Python 3.8: TZIDs fall back to the local zone
 
 WIDTH, HEIGHT = 1072, 1448  # the Voyage's panel, portrait
 DAYS = 7  # today plus the week ahead
+# chrome-headless-shell as `npx @puppeteer/browsers install` lays it out, one
+# directory per platform and version; preferred because it has no app bundle,
+# so macOS's Dock does not collect an icon for every render
+HEADLESS_SHELL_GLOB = os.path.expanduser(
+    "~/.cache/puppeteer/chrome-headless-shell/*/chrome-headless-shell-*/chrome-headless-shell")
 # chromium-browser last: on Ubuntu it is a snap stub that only prints an error
-CHROME_CANDIDATES = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+CHROME_CANDIDATES = ("chrome-headless-shell",
+                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                      "chromium", "google-chrome", "google-chrome-stable", "chromium-browser")
 CACHE_DIR = os.environ.get("VOYAGE_CALENDAR_CACHE_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "voyage-calendar")
@@ -903,6 +915,9 @@ def chrome_binary():
     configured = os.environ.get("VOYAGE_CALENDAR_CHROME")
     if configured:
         return configured
+    shells = glob.glob(HEADLESS_SHELL_GLOB)
+    if shells:
+        return max(shells, key=headless_shell_version)
     for candidate in CHROME_CANDIDATES:
         if os.path.isabs(candidate):
             if os.path.exists(candidate):
@@ -910,6 +925,13 @@ def chrome_binary():
         elif shutil.which(candidate):
             return shutil.which(candidate)
     return None
+
+
+def headless_shell_version(path):
+    """The version in an installed chrome-headless-shell's directory name
+    (mac_arm-155.0.8059.84), as a tuple to compare installs by."""
+    release = os.path.basename(os.path.dirname(os.path.dirname(path))).rpartition("-")[2]
+    return tuple(int(part) for part in release.split(".") if part.isdigit())
 
 
 def screenshot(html_text, png_path, timeout=45):
@@ -1322,6 +1344,10 @@ def _test():
           keyed[keyed.index("-i") + 1] == "/ssh/key" and "IdentitiesOnly=yes" in keyed
           and "UserKnownHostsFile=" + os.path.join(CACHE_DIR, "known_hosts") in keyed)
     del os.environ["VOYAGE_CALENDAR_SSH_KEY"]
+    shell = "/c/chrome-headless-shell/mac_arm-{}/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+    check("the newest chrome-headless-shell wins by version, not by spelling",
+          max((shell.format(v) for v in ("99.0.1.2", "155.0.8059.84", "131.0.9.10")),
+              key=headless_shell_version) == shell.format("155.0.8059.84"))
 
     if chrome_binary():
         work = tempfile.mkdtemp(prefix="voyage-calendar-test-")
