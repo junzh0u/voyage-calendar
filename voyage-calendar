@@ -23,8 +23,13 @@ Configuration comes from the environment (a feed URL is a credential: anyone
 holding it reads the calendar):
   VOYAGE_CALENDAR_ICS_URLS   whitespace-separated feed URLs, or local .ics paths
                              (quotes around the whole list are fine); prefix
-                             one with a label, as in work=https://…, to mark
-                             its events with a briefcase before the title
+                             one with a label, as in work=https://…, to make
+                             it a work calendar: weekdays are work days and
+                             weekends personal, each day leads with a
+                             briefcase or a house, and only the events off theme
+                             for their day get an icon before the title — a
+                             house on a personal event on a weekday, a
+                             briefcase on a work event on a weekend
   VOYAGE_CALENDAR_EMAIL      optional: your address, to drop invitations you
                              declined
   VOYAGE_CALENDAR_HOST       the Kindle: an ssh host alias, an address, or
@@ -715,8 +720,18 @@ def esc(text):
     return html.escape(text, quote=True)
 
 
-def row_class(state, inst):
-    return state + (" marked" if inst.event.calendar else "")
+def day_theme(day):
+    """A weekday is a work day and a weekend a personal one; each day leads
+    with its icon, a briefcase or a house — today's on the date line, where
+    the long weekday names leave room for it."""
+    return "work" if day.weekday() < 5 else "personal"
+
+
+def row_class(state, inst, day):
+    """Only the events off theme for their day get an icon: the personal ones
+    (no label) on a work day, the labelled ones on a personal day."""
+    theme = "work" if inst.event.calendar else "personal"
+    return state + ("" if theme == day_theme(day) else " marked " + theme)
 
 
 def month_grid_html(today):
@@ -744,7 +759,7 @@ def month_grid_html(today):
             .format(today.strftime("%B %Y"), heads, "".join(rows)))
 
 
-def today_html(today_rows, budget):
+def today_html(today, today_rows, budget):
     """(html, px used) of today's section — what is over collapses to one
     line so what is next keeps its room late in the day."""
     parts = ['<section class="today"><h2>Today</h2>']
@@ -769,7 +784,7 @@ def today_html(today_rows, budget):
         else:
             time_html = "<b>{}</b><small>– {}</small>".format(esc(clock(inst.start)), esc(clock(inst.end)))
         parts.append('<div class="row {}"><div class="time">{}</div><div class="title">{}{}</div></div>'
-                     .format(row_class(state, inst), time_html, esc(title),
+                     .format(row_class(state, inst, today), time_html, esc(title),
                              '<small>{}</small>'.format(esc(location)) if location else ""))
         used += TODAY_ROW_PX
     parts.append("</section>")
@@ -791,13 +806,13 @@ def upcoming_html(days, budget):
         if available < 0 or (rows and fit < 1) or shown_through != (day - dt.timedelta(days=1)):
             hidden += len(rows)
             continue
-        parts.append('<div class="day"><h3><span>{}</span>{}</h3>'.format(
-            day.strftime("%A %-d"), '<span class="none">nothing</span>' if not rows else ""))
+        parts.append('<div class="day"><h3><span class="themed {}">{}</span>{}</h3>'.format(
+            day_theme(day), day.strftime("%A %-d"), '<span class="none">nothing</span>' if not rows else ""))
         budget -= DAY_HEADING_PX
         shown_through = day
         for label, title, state, inst in rows[:fit]:
             parts.append('<div class="row {}"><div class="time">{}</div><div class="title">{}</div></div>'
-                         .format(row_class(state, inst), esc(label), esc(title)))
+                         .format(row_class(state, inst, day), esc(label), esc(title)))
             budget -= DAY_ROW_PX
         if fit < len(rows):
             parts.append('<div class="more">+{} more</div>'.format(len(rows) - fit))
@@ -824,17 +839,17 @@ def render_html(days, now, stale_feeds=0, feed_count=1, rotate=0):
     turns the other way so it reads upright."""
     landscape = rotate in (90, 270)
     today, today_rows = days[0]
-    header = '<div class="head"><div class="weekday">{}</div><div class="date">{}</div></div>'.format(
-        today.strftime("%A"), today.strftime("%B %-d, %Y"))
+    header = '<div class="head"><div class="weekday">{}</div><div class="date themed {}">{}</div></div>'.format(
+        today.strftime("%A"), day_theme(today), today.strftime("%B %-d, %Y"))
     grid = month_grid_html(today)
     if landscape:
-        today_part, _ = today_html(today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX)
+        today_part, _ = today_html(today, today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX)
         week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX)
         body = ('<div class="page"><div class="cols"><div class="left">{}{}{}</div><div class="right">{}</div></div>{}</div>'
                 .format(header, grid, today_part, week_part,
                         footer_html(now, days, shown_through, hidden, stale_feeds, feed_count)))
     else:
-        today_part, used = today_html(today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
+        today_part, used = today_html(today, today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
         week_part, shown_through, hidden = upcoming_html(
             days, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX - used)
         body = '<div class="page"><header>{}{}</header>{}{}{}</div>'.format(
@@ -870,11 +885,13 @@ h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacin
 .title { flex: 1; font-size: 40px; font-weight: 500; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .title small { display: block; font-size: 26px; color: #555; font-weight: 400; margin-top: 4px; }
 .row.now { border-left: 12px solid #000; padding-left: 20px; margin-left: -32px; }  /* in the gutter: columns stay aligned */
-/* a labelled feed's titles lead with an outlined briefcase, cut from the
-   text colour by a mask so it stays black, and sized with the title */
-.row.marked .title::before { content: ""; display: inline-block; width: 0.8em; height: 0.72em; margin-right: 0.28em;
-  vertical-align: -0.04em; background: currentColor;
-  -webkit-mask: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><rect x='1.6' y='5' width='20.8' height='15.4' rx='2'/><path d='M8.2 5V3.2a1.2 1.2 0 0 1 1.2-1.2h5.2a1.2 1.2 0 0 1 1.2 1.2V5M1.6 11.4h20.8'/></g></svg>") center / contain no-repeat; }
+/* a day leads with its theme's outlined icon (day_theme), and so does
+   an off-theme event's title (row_class); cut from the text colour by a mask
+   so it stays black, and sized with the text */
+.themed::before, .row.marked .title::before { content: ""; display: inline-block; width: 0.8em; height: 0.72em; margin-right: 0.28em;
+  vertical-align: -0.04em; background: currentColor; -webkit-mask: center / contain no-repeat; }
+.themed.work::before, .row.work .title::before { -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><rect x='1.6' y='5' width='20.8' height='15.4' rx='2'/><path d='M8.2 5V3.2a1.2 1.2 0 0 1 1.2-1.2h5.2a1.2 1.2 0 0 1 1.2 1.2V5M1.6 11.4h20.8'/></g></svg>"); }
+.themed.personal::before, .row.personal .title::before { -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><path d='M2 10.4 12 2l10 8.4M4.6 8.3v12.1h14.8V8.3'/><path d='M9.6 20.4v-6.2h4.8v6.2'/></g></svg>"); }
 .earlier { font-size: 28px; color: #777; padding: 8px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .earlier span { font-weight: 700; text-transform: uppercase; letter-spacing: 2px; font-size: 22px; margin-right: 14px; }
 .empty { font-size: 36px; color: #777; padding: 8px 0; }
@@ -1287,13 +1304,20 @@ def _test():
     check("text agenda marks the running event", "▶ 11:30 AM – 12:30 PM  Now" in text, text)
 
     page = render_html(days, now, stale_feeds=1, feed_count=2)
-    check("unlabelled rows carry no briefcase", "marked" not in page.split("</style>")[1])
+    check("a weekday marks its personal rows with a house, running or not",
+          'class="row now marked personal"' in page and 'class="row later marked personal"' in page)
     for i in inst:
         if i.title in ("Now", "Overnight"):
             i.event.calendar = "work"
     marked = render_html(days, now)
-    check("a labelled feed's rows are marked, running or not",
-          'class="row now marked"' in marked and 'class="row later marked"' in marked)
+    check("a weekday leaves its work rows unmarked",
+          'class="row now"' in marked and "marked work" not in marked.split("</style>")[1])
+    check("each day's name carries its theme", '<div class="date themed work">September 3' in page
+          and '<span class="themed personal">Saturday 5' in page and '<span class="themed work">Friday 4' in page)
+    work, personal = next(i for i in inst if i.event.calendar), next(i for i in inst if not i.event.calendar)
+    saturday = dt.date(2026, 9, 5)
+    check("a weekend marks its work rows with a briefcase and leaves the personal ones",
+          row_class("later", work, saturday) == "later marked work" and row_class("later", personal, saturday) == "later")
     check("text agenda names a labelled feed", "Overnight [work]" in agenda_text(days))
     for i in inst:
         i.event.calendar = ""
