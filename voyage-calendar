@@ -29,10 +29,10 @@ holding it reads the calendar):
                              one with a label, as in work=https://…, to make
                              it a work calendar: weekdays are work days and
                              weekends personal, each day leads with a
-                             briefcase or a house, and only the events off theme
-                             for their day get an icon before the title — a
-                             house on a personal event on a weekday, a
-                             briefcase on a work event on a weekend
+                             briefcase or a house, and only the events off
+                             theme for their day print white on black — a
+                             personal event on a weekday, a work event on a
+                             weekend
   VOYAGE_CALENDAR_EMAIL      optional: your address, to drop invitations you
                              declined
   VOYAGE_CALENDAR_HOST       the Kindle: an ssh host alias, an address, or
@@ -751,10 +751,10 @@ def day_theme(day):
 
 
 def row_class(state, inst, day):
-    """Only the events off theme for their day get an icon: the personal ones
+    """Only the events off theme for their day are marked: the personal ones
     (no label) on a work day, the labelled ones on a personal day."""
     theme = "work" if inst.event.calendar else "personal"
-    return state + ("" if theme == day_theme(day) else " marked " + theme)
+    return state + ("" if theme == day_theme(day) else " marked")
 
 
 def month_grid_html(today):
@@ -915,13 +915,19 @@ h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacin
 .title { flex: 1; font-size: 40px; font-weight: 500; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .title small { display: block; font-size: 26px; color: #555; font-weight: 400; margin-top: 4px; }
 .row.now { border-left: 12px solid #000; padding-left: 20px; margin-left: -32px; }  /* in the gutter: columns stay aligned */
-/* a day leads with its theme's outlined icon (day_theme), and so does
-   an off-theme event's title (row_class); cut from the text colour by a mask
-   so it stays black, and sized with the text */
-.themed::before, .row.marked .title::before { content: ""; display: inline-block; width: 0.8em; height: 0.72em; margin-right: 0.28em;
+/* a day leads with its theme's outlined icon (day_theme), cut from the text
+   colour by a mask so it stays black, and sized with the text */
+.themed::before { content: ""; display: inline-block; width: 0.8em; height: 0.72em; margin-right: 0.28em;
   vertical-align: -0.04em; background: currentColor; -webkit-mask: center / contain no-repeat; }
-.themed.work::before, .row.work .title::before { -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><rect x='1.6' y='5' width='20.8' height='15.4' rx='2'/><path d='M8.2 5V3.2a1.2 1.2 0 0 1 1.2-1.2h5.2a1.2 1.2 0 0 1 1.2 1.2V5M1.6 11.4h20.8'/></g></svg>"); }
-.themed.personal::before, .row.personal .title::before { -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><path d='M2 10.4 12 2l10 8.4M4.6 8.3v12.1h14.8V8.3'/><path d='M9.6 20.4v-6.2h4.8v6.2'/></g></svg>"); }
+.themed.work::before { -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><rect x='1.6' y='5' width='20.8' height='15.4' rx='2'/><path d='M8.2 5V3.2a1.2 1.2 0 0 1 1.2-1.2h5.2a1.2 1.2 0 0 1 1.2 1.2V5M1.6 11.4h20.8'/></g></svg>"); }
+.themed.personal::before { -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 22'><g fill='none' stroke='black' stroke-width='2.2' stroke-linejoin='round'><path d='M2 10.4 12 2l10 8.4M4.6 8.3v12.1h14.8V8.3'/><path d='M9.6 20.4v-6.2h4.8v6.2'/></g></svg>"); }
+/* an off-theme row (row_class) prints white on black, the fill reaching into the
+   gutter so the columns stay aligned; a white rule keeps neighbours apart */
+.row.marked { background: #000; color: #fff; border-bottom-color: #fff; padding-left: 16px; padding-right: 16px; margin: 0 -16px; }
+.row.marked small { color: #ccc !important; }
+h3 + .row.marked { margin-top: 6px; }
+/* a white sliver keeps the running row's bar apart from the fill */
+.row.now.marked { margin-left: -32px; padding-left: 20px; box-shadow: inset 6px 0 #fff; }
 .earlier { font-size: 28px; color: #777; padding: 8px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .earlier span { font-weight: 700; text-transform: uppercase; letter-spacing: 2px; font-size: 22px; margin-right: 14px; }
 .empty { font-size: 36px; color: #777; padding: 8px 0; }
@@ -1363,8 +1369,8 @@ def _test():
     check("text agenda marks the running event", "▶ 11:30 AM – 12:30 PM  Now" in text, text)
 
     page = render_html(days, now, stale_feeds=1, feed_count=2)
-    check("a weekday marks its personal rows with a house, running or not",
-          'class="row now marked personal"' in page and 'class="row later marked personal"' in page)
+    check("a weekday marks its personal rows, running or not",
+          'class="row now marked"' in page and 'class="row later marked"' in page)
     for i in inst:
         if i.title in ("Now", "Overnight"):
             i.event.calendar = "work"
@@ -1377,14 +1383,16 @@ def _test():
     check("the fingerprint ignores the Updated clock but not the events",
           page_fingerprint(marked) == page_fingerprint(render_html(days, now + dt.timedelta(minutes=10)))
           and page_fingerprint(marked) != page_fingerprint(page) and "Updated " in page)
-    check("a weekday leaves its work rows unmarked",
-          'class="row now"' in marked and "marked work" not in marked.split("</style>")[1])
+    weekday_work = [i for i in inst if i.event.calendar]
+    check("a weekday leaves its work rows unmarked", len(weekday_work) == 2
+          and all(row_class("now", i, dt.date(2026, 9, 3)) == "now" for i in weekday_work)
+          and 'class="row now"' in marked)
     check("each day's name carries its theme", '<div class="date themed work">September 3' in page
           and '<span class="themed personal">Saturday 5' in page and '<span class="themed work">Friday 4' in page)
     work, personal = next(i for i in inst if i.event.calendar), next(i for i in inst if not i.event.calendar)
     saturday = dt.date(2026, 9, 5)
-    check("a weekend marks its work rows with a briefcase and leaves the personal ones",
-          row_class("later", work, saturday) == "later marked work" and row_class("later", personal, saturday) == "later")
+    check("a weekend marks its work rows and leaves the personal ones",
+          row_class("later", work, saturday) == "later marked" and row_class("later", personal, saturday) == "later")
     check("text agenda names a labelled feed", "Overnight [work]" in agenda_text(days))
     for i in inst:
         i.event.calendar = ""
