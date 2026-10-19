@@ -729,6 +729,20 @@ EARLIER_PX = 48
 DAY_HEADING_PX = 58
 DAY_ROW_PX = 60
 MORE_PX = 40
+# a title wraps to at most two lines; the second costs this much more
+TODAY_WRAP_PX = 50
+DAY_WRAP_PX = 40
+# the title column (px wide, font px) per section, from the CSS below
+TITLE_COLUMNS = {("today", False): (708, 40), ("week", False): (668, 34),
+                 ("today", True): (316, 32), ("week", True): (488, 34)}
+# width in hundredths of an em of ASCII 32-126 in the page font at the
+# titles' weight, measured in Chrome; anything else counts a full em, and the
+# total is padded, so a title is never thought to fit when it would wrap
+CHAR_WIDTHS = (28, 28, 44, 56, 56, 100, 65, 28, 28, 28, 37, 60, 28, 39, 28, 35, 56, 56, 56,
+               56, 56, 56, 56, 56, 56, 56, 28, 28, 60, 60, 60, 56, 80, 67, 70, 72, 72, 63,
+               59, 76, 72, 28, 54, 69, 57, 89, 72, 76, 67, 76, 70, 65, 59, 72, 61, 94, 65,
+               65, 63, 30, 35, 30, 60, 50, 24, 56, 61, 56, 61, 56, 30, 59, 57, 24, 24, 54,
+               24, 87, 57, 59, 61, 61, 35, 52, 33, 57, 52, 78, 54, 52, 50, 30, 22, 30, 60)
 # portrait: header (weekday, date, month grid) above one column
 PORTRAIT_PAGE_PX = HEIGHT - 44 - 36
 PORTRAIT_HEADER_PX = 320
@@ -741,6 +755,13 @@ LANDSCAPE_LEFT_HEADER_PX = 470
 
 def esc(text):
     return html.escape(text, quote=True)
+
+
+def wraps(title, section, landscape):
+    """Whether title takes a second line in its section's title column."""
+    width, font = TITLE_COLUMNS[section, landscape]
+    ems = sum(CHAR_WIDTHS[ord(c) - 32] if 32 <= ord(c) < 127 else 100 for c in title) / 100
+    return ems * font * 1.05 > width
 
 
 def day_theme(day):
@@ -782,7 +803,7 @@ def month_grid_html(today):
             .format(today.strftime("%B %Y"), heads, "".join(rows)))
 
 
-def today_html(today, today_rows, budget):
+def today_html(today, today_rows, budget, landscape=False):
     """(html, px used) of today's section — what is over collapses to one
     line so what is next keeps its room late in the day."""
     parts = ['<section class="today"><h2>Today</h2>']
@@ -797,7 +818,8 @@ def today_html(today, today_rows, budget):
         used += EARLIER_PX
     for i, (label, title, state, inst) in enumerate(pending):
         remaining_rows = len(pending) - i
-        if budget - used - TODAY_ROW_PX < (MORE_PX if remaining_rows > 1 else 0):
+        row_px = TODAY_ROW_PX + (TODAY_WRAP_PX if wraps(title, "today", landscape) else 0)
+        if budget - used - row_px < (MORE_PX if remaining_rows > 1 else 0):
             parts.append('<div class="more">+{} more</div>'.format(remaining_rows))
             used += MORE_PX
             break
@@ -806,15 +828,15 @@ def today_html(today, today_rows, budget):
             time_html = "<b>{}</b>".format(esc(label))
         else:
             time_html = "<b>{}</b><small>– {}</small>".format(esc(clock(inst.start)), esc(clock(inst.end)))
-        parts.append('<div class="row {}"><div class="time">{}</div><div class="title">{}{}</div></div>'
+        parts.append('<div class="row {}"><div class="time">{}</div><div class="title"><span>{}</span>{}</div></div>'
                      .format(row_class(state, inst, today), time_html, esc(title),
                              '<small>{}</small>'.format(esc(location)) if location else ""))
-        used += TODAY_ROW_PX
+        used += row_px
     parts.append("</section>")
     return "".join(parts), used
 
 
-def upcoming_html(days, budget):
+def upcoming_html(days, budget, landscape=False):
     """(html, last day shown, rows hidden) of the week ahead, compact; a day
     is printed only with at least one row, and once a day is skipped the
     rest of the week is too."""
@@ -823,8 +845,12 @@ def upcoming_html(days, budget):
     shown_through, hidden = today, 0
     for day, rows in days[1:]:
         available = budget - DAY_HEADING_PX
-        fit = min(len(rows), max(0, available) // DAY_ROW_PX)
-        if fit < len(rows) and available - fit * DAY_ROW_PX < MORE_PX:
+        heights = [DAY_ROW_PX + (DAY_WRAP_PX if wraps(row[1], "week", landscape) else 0) for row in rows]
+        fit = used = 0
+        while fit < len(rows) and used + heights[fit] <= available:
+            used += heights[fit]
+            fit += 1
+        if fit < len(rows) and fit and available - used < MORE_PX:
             fit -= 1  # make room for the "+N more" line
         if available < 0 or (rows and fit < 1) or shown_through != (day - dt.timedelta(days=1)):
             hidden += len(rows)
@@ -833,10 +859,10 @@ def upcoming_html(days, budget):
             day_theme(day), day.strftime("%A %-d"), '<span class="none">nothing</span>' if not rows else ""))
         budget -= DAY_HEADING_PX
         shown_through = day
-        for label, title, state, inst in rows[:fit]:
-            parts.append('<div class="row {}"><div class="time">{}</div><div class="title">{}</div></div>'
+        for (label, title, state, inst), height in zip(rows[:fit], heights):
+            parts.append('<div class="row {}"><div class="time">{}</div><div class="title"><span>{}</span></div></div>'
                          .format(row_class(state, inst, day), esc(label), esc(title)))
-            budget -= DAY_ROW_PX
+            budget -= height
         if fit < len(rows):
             parts.append('<div class="more">+{} more</div>'.format(len(rows) - fit))
             budget -= MORE_PX
@@ -873,8 +899,8 @@ def render_html(days, now, stale_feeds=0, feed_count=1, rotate=0):
         today.strftime("%A"), day_theme(today), today.strftime("%B %-d, %Y"))
     grid = month_grid_html(today)
     if landscape:
-        today_part, _ = today_html(today, today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX)
-        week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX)
+        today_part, _ = today_html(today, today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX, True)
+        week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX, True)
         body = ('<div class="page"><div class="cols"><div class="left">{}{}{}</div><div class="right">{}</div></div>{}</div>'
                 .format(header, grid, today_part, week_part,
                         footer_html(now, days, shown_through, hidden, stale_feeds, feed_count)))
@@ -912,8 +938,10 @@ h2 { font-size: 28px; font-weight: 700; text-transform: uppercase; letter-spacin
 .today .time { flex-basis: 260px; font-size: 38px; line-height: 1.15; }
 .today .time b { display: block; font-weight: 700; }
 .today .time small { display: block; font-size: 26px; color: #555; font-weight: 500; margin-top: 4px; }
-.title { flex: 1; font-size: 40px; font-weight: 500; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.title small { display: block; font-size: 26px; color: #555; font-weight: 400; margin-top: 4px; }
+.title { flex: 1; min-width: 0; font-size: 40px; font-weight: 500; line-height: 1.15; }
+/* the title wraps to two lines at most, then ends in an ellipsis (wraps()) */
+.title span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.title small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; font-size: 26px; color: #555; font-weight: 400; margin-top: 4px; }
 .row.now { border-left: 12px solid #000; padding-left: 20px; margin-left: -32px; }  /* in the gutter: columns stay aligned */
 /* a day leads with its theme's outlined icon (day_theme), cut from the text
    colour by a mask so it stays black, and sized with the text */
@@ -1375,6 +1403,10 @@ def _test():
         if i.title in ("Now", "Overnight"):
             i.event.calendar = "work"
     marked = render_html(days, now)
+    check("a long title wraps, a short one fits, and each character counts its own width",
+          wraps("Quarterly planning review with the infrastructure team", "week", False)
+          and not wraps("SM Daily Stand Up", "week", False) and not wraps("i" * 60, "week", False) and wraps("M" * 60, "week", False)
+          and wraps("你好世界" * 5, "week", False) and not wraps("abc" * 5, "week", False))
     at = dt.datetime(2026, 9, 3, 10, 0)
     check("--heartbeat pushes a changed page at once and an unchanged one on schedule",
           due("a", "a", at, None) and due("b", "a", at.replace(minute=7), 60)
