@@ -2,7 +2,7 @@
 
 Turns a jailbroken Kindle Voyage into an always-on wall calendar for Google Calendar. A launch agent on a Mac fetches the calendars' secret iCal feeds every ten minutes, renders the coming week as a page sized for the Voyage's 300 ppi panel, screenshots it with headless Chrome, and pushes the image to the Kindle over SSH, where FBInk paints it.
 
-The layout: today in detail, the next days compact, the month grid, and a footer with the last update time. What is already over today collapses into one line so the rest keeps its room; a week that does not fit says how far it got. `--rotate DEG` says how far the Kindle is turned clockwise from upright: 180 flips the portrait page, and 90 (top edge to the right) or 270 (top edge to the left) split it into two columns for a Kindle lying on its side.
+The layout: today in detail, the next days compact, the month grid, and a footer with the last update time. What is already over today collapses into one line so the rest keeps its room; a week that does not fit says how far it got. `--rotate DEG` says how far the Kindle is turned clockwise from upright: 180 flips the portrait page, and 90 (top edge to the right) or 270 (top edge to the left) split it into two columns for a Kindle lying on its side, where what of today the left column cannot hold leads the right column as "Today, continued", printed like any other day.
 
 The push also turns the Kindle into a kiosk: the reader framework is stopped so nothing repaints over the calendar, the device is kept from sleeping, and a small keeper loop left on the Kindle brings Wi-Fi back whenever it drops. `--restore` hands the reader UI back; a reboot does the same on its own.
 

@@ -83,7 +83,7 @@ Modes:
                 default) or 180 keep the one-column portrait page, 90 (top
                 edge to the right) or 270 (top edge to the left) switch to two
                 columns — weekday, month and today on the left, the week on
-                the right
+                the right, led by whatever of today the left cannot hold
   --png PATH    also save the rendered screenshot to PATH
   --html PATH   also save the rendered page to PATH (to iterate on the layout)
   --restore     hand the Kindle back to the reader UI (start the framework,
@@ -731,6 +731,9 @@ DAY_ROW_PX = 60
 MORE_PX = 40
 # a title wraps to at most two lines; the second costs this much more
 TODAY_WRAP_PX = 50
+# landscape's today rows are smaller (its CSS at the end)
+LANDSCAPE_TODAY_ROW_PX = 90
+LANDSCAPE_TODAY_WRAP_PX = 40
 DAY_WRAP_PX = 40
 # the title column (px wide, font px) per section, from the CSS below
 TITLE_COLUMNS = {("today", False): (708, 40), ("week", False): (668, 34),
@@ -748,7 +751,9 @@ PORTRAIT_PAGE_PX = HEIGHT - 44 - 36
 PORTRAIT_HEADER_PX = 320
 # landscape, --rotate 90 or 270 (the page drawn 1448x1072 and turned onto the
 # portrait panel):
-# weekday, date, month grid and today in the left column, the week in the right
+# weekday, date, month grid and today in the left column, the week in the
+# right; today's rows that the left column cannot hold head the week, printed
+# like any other day
 LANDSCAPE_PAGE_PX = WIDTH - 40 - 32
 LANDSCAPE_LEFT_HEADER_PX = 470
 
@@ -803,23 +808,18 @@ def month_grid_html(today):
             .format(today.strftime("%B %Y"), heads, "".join(rows)))
 
 
-def today_html(today, today_rows, budget, landscape=False):
-    """(html, px used) of today's section — what is over collapses to one
-    line so what is next keeps its room late in the day."""
-    parts = ['<section class="today"><h2>Today</h2>']
-    used = TODAY_HEADING_PX
-    earlier = [title for _, title, state, _ in today_rows if state == "past"]
-    pending = [row for row in today_rows if row[2] != "past"]
-    if earlier:
-        parts.append('<div class="earlier"><span>Earlier</span>{}</div>'.format(esc(" · ".join(earlier))))
-        used += EARLIER_PX
-    if not pending:
-        parts.append('<div class="empty">{}</div>'.format("Nothing more today" if earlier else "Nothing scheduled"))
-        used += EARLIER_PX
-    for i, (label, title, state, inst) in enumerate(pending):
-        remaining_rows = len(pending) - i
-        row_px = TODAY_ROW_PX + (TODAY_WRAP_PX if wraps(title, "today", landscape) else 0)
-        if budget - used - row_px < (MORE_PX if remaining_rows > 1 else 0):
+def today_rows_html(today, rows, budget, section, landscape, spill=False):
+    """(html, px used, rows left over) of today's pending rows in budget px.
+    Rows that do not fit are left over to continue elsewhere when spill is
+    set, and are otherwise counted in a "+N more" line."""
+    parts, used = [], 0
+    for i, (label, title, state, inst) in enumerate(rows):
+        remaining_rows = len(rows) - i
+        row_px, wrap_px = (LANDSCAPE_TODAY_ROW_PX, LANDSCAPE_TODAY_WRAP_PX) if landscape else (TODAY_ROW_PX, TODAY_WRAP_PX)
+        row_px += wrap_px if wraps(title, section, landscape) else 0
+        if budget - used - row_px < (MORE_PX if remaining_rows > 1 and not spill else 0):
+            if spill:
+                return "".join(parts), used, rows[i:]
             parts.append('<div class="more">+{} more</div>'.format(remaining_rows))
             used += MORE_PX
             break
@@ -832,18 +832,39 @@ def today_html(today, today_rows, budget, landscape=False):
                      .format(row_class(state, inst, today), time_html, esc(title),
                              '<small>{}</small>'.format(esc(location)) if location else ""))
         used += row_px
+    return "".join(parts), used, []
+
+
+def today_html(today, today_rows, budget, landscape=False, spill=False):
+    """(html, px used, rows left over) of today's section — what is over
+    collapses to one line so what is next keeps its room late in the day.
+    With spill, the rows that do not fit are left over for upcoming_html
+    instead of ending in "+N more"."""
+    parts = ['<section class="today"><h2>Today</h2>']
+    used = TODAY_HEADING_PX
+    earlier = [title for _, title, state, _ in today_rows if state == "past"]
+    pending = [row for row in today_rows if row[2] != "past"]
+    if earlier:
+        parts.append('<div class="earlier"><span>Earlier</span>{}</div>'.format(esc(" · ".join(earlier))))
+        used += EARLIER_PX
+    if not pending:
+        parts.append('<div class="empty">{}</div>'.format("Nothing more today" if earlier else "Nothing scheduled"))
+        used += EARLIER_PX
+    rows_part, rows_used, rest = today_rows_html(today, pending, budget - used, "today", landscape, spill)
+    parts.append(rows_part)
     parts.append("</section>")
-    return "".join(parts), used
+    return "".join(parts), used + rows_used, rest
 
 
-def upcoming_html(days, budget, landscape=False):
+def upcoming_html(days, budget, landscape=False, today_rest=()):
     """(html, last day shown, rows hidden) of the week ahead, compact; a day
     is printed only with at least one row, and once a day is skipped the
-    rest of the week is too."""
+    rest of the week is too. today_rest, the today rows today_html left
+    over, comes first, printed like the other days under "Today, continued"."""
     parts = ['<section class="upcoming">']
     today = days[0][0]
-    shown_through, hidden = today, 0
-    for day, rows in days[1:]:
+    shown_through, hidden = today - dt.timedelta(days=1 if today_rest else 0), 0
+    for day, rows in ([(today, list(today_rest))] if today_rest else []) + days[1:]:
         available = budget - DAY_HEADING_PX
         heights = [DAY_ROW_PX + (DAY_WRAP_PX if wraps(row[1], "week", landscape) else 0) for row in rows]
         fit = used = 0
@@ -856,7 +877,7 @@ def upcoming_html(days, budget, landscape=False):
             hidden += len(rows)
             continue
         parts.append('<div class="day"><h3><span class="themed {}">{}</span>{}</h3>'.format(
-            day_theme(day), day.strftime("%A %-d"), '<span class="none">nothing</span>' if not rows else ""))
+            day_theme(day), "Today, continued" if day == today else day.strftime("%A %-d"), '<span class="none">nothing</span>' if not rows else ""))
         budget -= DAY_HEADING_PX
         shown_through = day
         for (label, title, state, inst), height in zip(rows[:fit], heights):
@@ -899,13 +920,14 @@ def render_html(days, now, stale_feeds=0, feed_count=1, rotate=0):
         today.strftime("%A"), day_theme(today), today.strftime("%B %-d, %Y"))
     grid = month_grid_html(today)
     if landscape:
-        today_part, _ = today_html(today, today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX, True)
-        week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX, True)
+        today_part, _, rest = today_html(
+            today, today_rows, LANDSCAPE_PAGE_PX - LANDSCAPE_LEFT_HEADER_PX - FOOTER_PX, True, spill=True)
+        week_part, shown_through, hidden = upcoming_html(days, LANDSCAPE_PAGE_PX - FOOTER_PX, True, rest)
         body = ('<div class="page"><div class="cols"><div class="left">{}{}{}</div><div class="right">{}</div></div>{}</div>'
                 .format(header, grid, today_part, week_part,
                         footer_html(now, days, shown_through, hidden, stale_feeds, feed_count)))
     else:
-        today_part, used = today_html(today, today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
+        today_part, used, _ = today_html(today, today_rows, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX)
         week_part, shown_through, hidden = upcoming_html(
             days, PORTRAIT_PAGE_PX - PORTRAIT_HEADER_PX - FOOTER_PX - used)
         body = '<div class="page"><header>{}{}</header>{}{}{}</div>'.format(
@@ -1443,6 +1465,13 @@ def _test():
     wide = render_html(days, now, rotate=90)
     check("--rotate 90 turns the page and splits it into columns",
           'class="landscape r90"' in wide and 'class="left"' in wide and "Overnight" in wide)
+    busy = agenda(run(feed(*["UID:b{0}\nDTSTART;TZID=America/Los_Angeles:20260903T{1:02d}{2:02d}00\nDURATION:PT20M\nSUMMARY:B{0}"
+                             .format(i, 13 + i // 2, i % 2 * 30) for i in range(12)])), dt.date(2026, 9, 3), now)
+    busy_wide = render_html(busy, now, rotate=90)
+    left, _, right = busy_wide.partition('<div class="right">')
+    check("--rotate 90 continues today's overflow as the first day of the right column",
+          "B0<" in left and "B11<" in right and "more</div>" not in left
+          and right.index("Today, continued") < right.index("B11<") < right.index("Friday 4"))
     check("--rotate 270 is landscape turned the other way", 'class="landscape r270"' in render_html(days, now, rotate=270))
     check("--rotate 180 keeps the portrait page upside down", 'class="portrait r180"' in render_html(days, now, rotate=180))
     with open(os.devnull, "w") as quiet, contextlib.redirect_stderr(quiet):
