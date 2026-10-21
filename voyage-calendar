@@ -751,11 +751,13 @@ PORTRAIT_PAGE_PX = HEIGHT - 44 - 36
 PORTRAIT_HEADER_PX = 320
 # landscape, --rotate 90 or 270 (the page drawn 1448x1072 and turned onto the
 # portrait panel):
-# weekday, date, month grid and today in the left column, the week in the
+# weekday, month grid and today in the left column, the week in the
 # right; today's rows that the left column cannot hold head the week, printed
 # like any other day
 LANDSCAPE_PAGE_PX = WIDTH - 40 - 32
-LANDSCAPE_LEFT_HEADER_PX = 470
+LANDSCAPE_LEFT_HEADER_PX = 410
+# today's heading there is a day's (h3), set apart from the month grid above
+LANDSCAPE_TODAY_HEADING_PX = DAY_HEADING_PX + 8
 
 
 def esc(text):
@@ -772,7 +774,7 @@ def wraps(title, section, landscape):
 def day_theme(day):
     """A weekday is a work day and a weekend a personal one; each day leads
     with its icon, a briefcase or a house — today's on the date line, where
-    the long weekday names leave room for it."""
+    the long weekday names leave room for it, or in landscape on its heading."""
     return "work" if day.weekday() < 5 else "personal"
 
 
@@ -840,8 +842,12 @@ def today_html(today, today_rows, budget, landscape=False, spill=False):
     collapses to one line so what is next keeps its room late in the day.
     With spill, the rows that do not fit are left over for upcoming_html
     instead of ending in "+N more"."""
-    parts = ['<section class="today"><h2>Today</h2>']
-    used = TODAY_HEADING_PX
+    if landscape:
+        parts = ['<section class="today"><h3><span class="themed {}">Today</span></h3>'.format(day_theme(today))]
+        used = LANDSCAPE_TODAY_HEADING_PX
+    else:
+        parts = ['<section class="today"><h2>Today</h2>']
+        used = TODAY_HEADING_PX
     earlier = [title for _, title, state, _ in today_rows if state == "past"]
     pending = [row for row in today_rows if row[2] != "past"]
     if earlier:
@@ -916,8 +922,11 @@ def render_html(days, now, stale_feeds=0, feed_count=1, rotate=0):
     turns the other way so it reads upright."""
     landscape = rotate in (90, 270)
     today, today_rows = days[0]
-    header = '<div class="head"><div class="weekday">{}</div><div class="date themed {}">{}</div></div>'.format(
-        today.strftime("%A"), day_theme(today), today.strftime("%B %-d, %Y"))
+    # landscape drops the date line: the month grid beside the weekday says
+    # it, and today's heading carries the theme icon instead
+    date = '' if landscape else '<div class="date themed {}">{}</div>'.format(
+        day_theme(today), today.strftime("%B %-d, %Y"))
+    header = '<div class="head"><div class="weekday">{}</div>{}</div>'.format(today.strftime("%A"), date)
     grid = month_grid_html(today)
     if landscape:
         today_part, _, rest = today_html(
@@ -982,8 +991,8 @@ h3 + .row.marked { margin-top: 6px; }
 .earlier span { font-weight: 700; text-transform: uppercase; letter-spacing: 2px; font-size: 22px; margin-right: 14px; }
 .empty { font-size: 36px; color: #777; padding: 8px 0; }
 .upcoming .day { margin-top: 14px; }
-.upcoming h3 { display: flex; justify-content: space-between; align-items: baseline; font-size: 28px; font-weight: 800; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 2px; border-bottom: 3px solid #000; padding-bottom: 6px; }
-.upcoming h3 .none { font-weight: 400; color: #999; letter-spacing: 0; text-transform: none; font-size: 26px; }
+h3 { display: flex; justify-content: space-between; align-items: baseline; font-size: 28px; font-weight: 800; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 2px; border-bottom: 3px solid #000; padding-bottom: 6px; }
+h3 .none { font-weight: 400; color: #999; letter-spacing: 0; text-transform: none; font-size: 26px; }
 .upcoming .time { flex-basis: 300px; font-size: 28px; }
 .upcoming .title { font-size: 34px; }
 .more { font-size: 28px; color: #666; padding: 6px 0; }
@@ -999,9 +1008,9 @@ footer { margin-top: auto; display: flex; justify-content: space-between; font-s
 .landscape .left { flex: 0 0 520px; min-width: 0; padding-right: 44px; border-right: 6px solid #000; margin-right: 44px; display: flex; flex-direction: column; }
 .landscape .right { flex: 1; min-width: 0; }
 .landscape .weekday { font-size: 92px; }
-.landscape .date { font-size: 38px; margin-top: 12px; }
+.landscape .today h3 { margin-top: 22px; }
 .landscape .month { margin-top: 22px; }
-.landscape .month caption { text-align: left; }
+.landscape .month caption { text-align: center; }
 .landscape .today .row { padding-top: 10px; padding-bottom: 10px; }
 .landscape .today .time { flex-basis: 160px; font-size: 32px; }
 .landscape .today .time small { font-size: 22px; }
@@ -1472,6 +1481,8 @@ def _test():
     check("--rotate 90 continues today's overflow as the first day of the right column",
           "B0<" in left and "B11<" in right and "more</div>" not in left
           and right.index("Today, continued") < right.index("B11<") < right.index("Friday 4"))
+    check("landscape drops the date line and heads today like a day, with its theme",
+          'class="date' not in wide and '<h3><span class="themed work">Today</span></h3>' in wide)
     check("--rotate 270 is landscape turned the other way", 'class="landscape r270"' in render_html(days, now, rotate=270))
     check("--rotate 180 keeps the portrait page upside down", 'class="portrait r180"' in render_html(days, now, rotate=180))
     with open(os.devnull, "w") as quiet, contextlib.redirect_stderr(quiet):
