@@ -53,6 +53,7 @@ just push --restore
 ```sh
 just check      # ruff + the built-in tests (./voyage-calendar --test)
 just push       # one push now with the agent's .env, key and cache, instead of waiting for its next round
+just render     # dry run: render the page upright to render.png (or `just render PATH`); never touches the Kindle
 ```
 
 Recurrence covers what Google Calendar writes: DAILY, WEEKLY, MONTHLY (by day of month or ordinal weekday), YEARLY, with INTERVAL, COUNT, UNTIL, EXDATE, RDATE, and per-instance overrides (moved and cancelled instances). Unsupported rules degrade to the first occurrence.

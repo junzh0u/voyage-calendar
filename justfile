@@ -34,3 +34,8 @@ install:
 # cache as the launch agent, instead of waiting for its next round
 push *args:
     VOYAGE_CALENDAR_SSH_KEY="$HOME/.ssh/kindle_voyage" VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --rotate 90 {{ args }}
+
+# Render the page upright to a PNG with .env and the agent's cache, printing
+# the agenda as text; never touches the Kindle
+render png="render.png" *args:
+    VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --dry-run --png {{ png }} {{ args }}
