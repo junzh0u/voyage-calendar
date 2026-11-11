@@ -18,6 +18,8 @@ fix:
 # cache/ beside it and the Kindle's key at ~/.ssh/kindle_voyage; it logs to
 # ~/Library/Logs/voyage-calendar.log. Rerun after moving the checkout or
 # editing the plist, or to update the headless shell.
+
+# Install the headless shell and the launch agent that paints the Kindle
 install:
     #!/bin/sh
     set -eu
@@ -32,10 +34,14 @@ install:
 
 # Paint the Kindle once now from this checkout, with the same .env, key and
 # cache as the launch agent, instead of waiting for its next round
+
+# Paint the Kindle once now from this checkout
 push *args:
     VOYAGE_CALENDAR_SSH_KEY="$HOME/.ssh/kindle_voyage" VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --rotate 90 {{ args }}
 
 # Render the page upright to a PNG with .env and the agent's cache, printing
 # the agenda as text; never touches the Kindle
+
+# Render the page upright to a PNG; never touches the Kindle
 render png="render.png" *args:
     VOYAGE_CALENDAR_CACHE_DIR=cache ./voyage-calendar --dry-run --png {{ png }} {{ args }}
