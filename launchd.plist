@@ -15,7 +15,7 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>set -a; . ./.env; set +a; exec ./voyage-calendar --rotate 90 --heartbeat 60</string>
+		<string>set -a; . ./.env; set +a; exec ${VOYAGE_CALENDAR_WRAP:-} ./voyage-calendar --rotate 90 --heartbeat 60</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

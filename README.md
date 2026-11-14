@@ -31,6 +31,7 @@ The variables in `.env`, sourced by `sh` (keep the feed list quoted) and read by
 | `VOYAGE_CALENDAR_EMAIL` | optional: your address, so invitations you declined are dropped |
 | `VOYAGE_CALENDAR_HOST` | the Kindle's address, or `user@address` (the user defaults to `root`) |
 | `TZ` | optional: the zone the agenda is rendered in (default: the Mac's) |
+| `VOYAGE_CALENDAR_WRAP` | optional, launch agent only: a command each round runs under, such as a job monitor's wrapper that records and reports the round (`/path/to/wrapper voyage-calendar`). It is split on spaces and gets the program and its arguments after its own; it must run them and exit with their status. Unset: the program runs directly |
 
 To give the Kindle back to the reader UI:
 
